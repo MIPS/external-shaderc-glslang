@@ -698,7 +698,9 @@ Id Builder::makeFloatConstant(float f, bool specConstant)
 {
     Op opcode = specConstant ? OpSpecConstant : OpConstant;
     Id typeId = makeFloatType(32);
-    unsigned value = *(unsigned int*)&f;
+    union { float fl; unsigned int ui; } u;
+    u.fl = f;
+    unsigned value = u.ui;
 
     // See if we already made it. Applies only to regular constants, because specialization constants
     // must remain distinct for the purpose of applying a SpecId decoration.
@@ -721,7 +723,9 @@ Id Builder::makeDoubleConstant(double d, bool specConstant)
 {
     Op opcode = specConstant ? OpSpecConstant : OpConstant;
     Id typeId = makeFloatType(64);
-    unsigned long long value = *(unsigned long long*)&d;
+    union { double db; unsigned long long ull; } u;
+    u.db = d;
+    unsigned long long value = u.ull;
     unsigned op1 = value & 0xFFFFFFFF;
     unsigned op2 = value >> 32;
 
@@ -1141,8 +1145,8 @@ void Builder::createNoResultOp(Op opCode, Id operand)
 void Builder::createNoResultOp(Op opCode, const std::vector<Id>& operands)
 {
     Instruction* op = new Instruction(opCode);
-    for (auto operand : operands)
-        op->addIdOperand(operand);
+    for (auto it = operands.cbegin(); it != operands.cend(); ++it)
+        op->addIdOperand(*it);
     buildPoint->addInstruction(std::unique_ptr<Instruction>(op));
 }
 
@@ -1197,8 +1201,8 @@ Id Builder::createTriOp(Op opCode, Id typeId, Id op1, Id op2, Id op3)
 Id Builder::createOp(Op opCode, Id typeId, const std::vector<Id>& operands)
 {
     Instruction* op = new Instruction(getUniqueId(), typeId, opCode);
-    for (auto operand : operands)
-        op->addIdOperand(operand);
+    for (auto it = operands.cbegin(); it != operands.cend(); ++it)
+        op->addIdOperand(*it);
     buildPoint->addInstruction(std::unique_ptr<Instruction>(op));
 
     return op->getResultId();
@@ -2106,9 +2110,9 @@ Id Builder::accessChainGetInferredType()
         type = getContainedTypeId(type);
 
     // dereference each index
-    for (auto deref : accessChain.indexChain) {
+    for (auto it = accessChain.indexChain.cbegin(); it != accessChain.indexChain.cend(); ++it) {
         if (isStructType(type))
-            type = getContainedTypeId(type, getConstantScalar(deref));
+            type = getContainedTypeId(type, getConstantScalar(*it));
         else
             type = getContainedTypeId(type);
     }
@@ -2117,13 +2121,49 @@ Id Builder::accessChainGetInferredType()
     if (accessChain.swizzle.size() == 1)
         type = getContainedTypeId(type);
     else if (accessChain.swizzle.size() > 1)
-        type = makeVectorType(getContainedTypeId(type), accessChain.swizzle.size());
+        type = makeVectorType(getContainedTypeId(type), (int)accessChain.swizzle.size());
 
     // dereference component selection
     if (accessChain.component)
         type = getContainedTypeId(type);
 
     return type;
+}
+
+// comment in header
+void Builder::eliminateDeadDecorations() {
+    std::unordered_set<const Block*> reachable_blocks;
+    std::unordered_set<Id> unreachable_definitions;
+    // Collect IDs defined in unreachable blocks. For each function, label the
+    // reachable blocks first. Then for each unreachable block, collect the
+    // result IDs of the instructions in it.
+    for (std::vector<Function*>::const_iterator fi = module.getFunctions().cbegin();
+        fi != module.getFunctions().cend(); fi++) {
+        Function* f = *fi;
+        Block* entry = f->getEntryBlock();
+        inReadableOrder(entry, [&reachable_blocks](const Block* b) {
+            reachable_blocks.insert(b);
+        });
+        for (std::vector<Block*>::const_iterator bi = f->getBlocks().cbegin();
+            bi != f->getBlocks().cend(); bi++) {
+            Block* b = *bi;
+            if (!reachable_blocks.count(b)) {
+                for (std::vector<std::unique_ptr<Instruction> >::const_iterator
+                         ii = b->getInstructions().cbegin();
+                    ii != b->getInstructions().cend(); ii++) {
+                    Instruction* i = ii->get();
+                    unreachable_definitions.insert(i->getResultId());
+                }
+            }
+        }
+    }
+    decorations.erase(std::remove_if(decorations.begin(), decorations.end(),
+        [&unreachable_definitions](std::unique_ptr<Instruction>& I) {
+            Instruction* inst = I.get();
+            Id decoration_id = inst->getIdOperand(0);
+            return unreachable_definitions.count(decoration_id) != 0;
+        }),
+        decorations.end());
 }
 
 void Builder::dump(std::vector<unsigned int>& out) const
@@ -2136,9 +2176,9 @@ void Builder::dump(std::vector<unsigned int>& out) const
     out.push_back(0);
 
     // Capabilities
-    for (auto cap : capabilities) {
+    for (auto it = capabilities.cbegin(); it != capabilities.cend(); ++it) {
         Instruction capInst(0, 0, OpCapability);
-        capInst.addImmediateOperand(cap);
+        capInst.addImmediateOperand(*it);
         capInst.dump(out);
     }
 

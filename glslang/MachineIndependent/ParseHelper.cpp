@@ -1524,6 +1524,11 @@ void TParseContext::builtInOpCheck(const TSourceLoc& loc, const TFunction& fnCan
         }
         break;
 
+    case EOpEmitStreamVertex:
+    case EOpEndStreamPrimitive:
+        intermediate.setMultiStream();
+        break;
+
     default:
         break;
     }
@@ -4050,6 +4055,8 @@ void TParseContext::setLayoutQualifier(const TSourceLoc& loc, TPublicType& publi
         if (id == "stream") {
             requireProfile(loc, ~EEsProfile, "selecting output stream");
             publicType.qualifier.layoutStream = value;
+            if (value > 0)
+                intermediate.setMultiStream();
             return;
         }
         break;
@@ -4476,6 +4483,8 @@ void TParseContext::layoutQualifierCheck(const TSourceLoc& loc, const TQualifier
     if (qualifier.layoutPushConstant) {
         if (qualifier.storage != EvqUniform)
             error(loc, "can only be used with a uniform", "push_constant", "");
+        if (qualifier.hasSet())
+            error(loc, "cannot be used with push_constant", "set", "");
     }
 }
 
