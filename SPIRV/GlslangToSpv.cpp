@@ -1629,7 +1629,7 @@ spv::Id TGlslangToSpvTraverser::createSpvVariable(const glslang::TIntermSymbol* 
     // First, steer off constants, which are not SPIR-V variables, but 
     // can still have a mapping to a SPIR-V Id.
     // This includes specialization constants.
-    if (node->getQualifier().storage == glslang::EvqConst) {
+    if (node->getQualifier().isConstant()) {
         return createSpvSpecConstant(*node);
     }
 
@@ -3435,11 +3435,12 @@ spv::Id TGlslangToSpvTraverser::createMiscOperation(glslang::TOperator op, spv::
         builder.promoteScalar(precision, operands.front(), operands[2]);
         break;
     case glslang::EOpMix:
-        if (isFloat)
+        if (! builder.isBoolType(builder.getScalarTypeId(builder.getTypeId(operands.back())))) {
+            assert(isFloat);
             libCall = spv::GLSLstd450FMix;
-        else {
+        } else {
             opCode = spv::OpSelect;
-            spv::MissingFunctionality("translating integer mix to OpSelect");
+            std::swap(operands.front(), operands.back());
         }
         builder.promoteScalar(precision, operands.front(), operands.back());
         break;
@@ -3731,7 +3732,7 @@ void TGlslangToSpvTraverser::addMemberDecoration(spv::Id id, int member, spv::De
 //  - when running into a non-spec-constant, switch to createSpvConstant()
 spv::Id TGlslangToSpvTraverser::createSpvSpecConstant(const glslang::TIntermTyped& node)
 {
-    assert(node.getQualifier().storage == glslang::EvqConst);
+    assert(node.getQualifier().isConstant());
 
     if (! node.getQualifier().specConstant) {
         // hand off to the non-spec-constant path
@@ -3762,6 +3763,7 @@ spv::Id TGlslangToSpvTraverser::createSpvSpecConstant(const glslang::TIntermType
             return builder.makeCompositeConstant(builder.makeVectorType(builder.makeUintType(32), 3), dimConstId, true);
         } else {
             spv::MissingFunctionality("specialization-constant expression trees");
+            exit(1);
             return spv::NoResult;
         }
     }
