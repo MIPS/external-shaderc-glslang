@@ -66,6 +66,27 @@ namespace {
 // or a different instruction sequence to do something gets used).
 const int GeneratorVersion = 1;
 
+namespace {
+class SpecConstantOpModeGuard {
+public:
+    SpecConstantOpModeGuard(spv::Builder* builder)
+        : builder_(builder) {
+        previous_flag_ = builder->isInSpecConstCodeGenMode();
+    }
+    ~SpecConstantOpModeGuard() {
+        previous_flag_ ? builder_->setToSpecConstCodeGenMode()
+                       : builder_->setToNormalCodeGenMode();
+    }
+    void turnOnSpecConstantOpMode() {
+        builder_->setToSpecConstCodeGenMode();
+    }
+
+private:
+    spv::Builder* builder_;
+    bool previous_flag_;
+};
+}
+
 //
 // The main holder of information for translating glslang to SPIR-V.
 //
@@ -128,8 +149,9 @@ protected:
     void addDecoration(spv::Id id, spv::Decoration dec, unsigned value);
     void addMemberDecoration(spv::Id id, int member, spv::Decoration dec);
     void addMemberDecoration(spv::Id id, int member, spv::Decoration dec, unsigned value);
-    spv::Id createSpvSpecConstant(const glslang::TIntermTyped&);
-    spv::Id createSpvConstant(const glslang::TType& type, const glslang::TConstUnionArray&, int& nextConst, bool specConstant);
+    spv::Id createSpvConstant(const glslang::TIntermTyped&);
+    spv::Id createSpvConstantFromConstUnionArray(const glslang::TType& type, const glslang::TConstUnionArray&, int& nextConst, bool specConstant);
+    spv::Id createSpvConstantFromConstSubTree(glslang::TIntermTyped* subTree);
     bool isTrivialLeaf(const glslang::TIntermTyped* node);
     bool isTrivial(const glslang::TIntermTyped* node);
     spv::Id createShortCircuit(glslang::TOperator, glslang::TIntermTyped& left, glslang::TIntermTyped& right);
@@ -160,15 +182,22 @@ protected:
 //
 
 // Translate glslang profile to SPIR-V source language.
-spv::SourceLanguage TranslateSourceLanguage(EProfile profile)
+spv::SourceLanguage TranslateSourceLanguage(glslang::EShSource source, EProfile profile)
 {
-    switch (profile) {
-    case ENoProfile:
-    case ECoreProfile:
-    case ECompatibilityProfile:
-        return spv::SourceLanguageGLSL;
-    case EEsProfile:
-        return spv::SourceLanguageESSL;
+    switch (source) {
+    case glslang::EShSourceGlsl:
+        switch (profile) {
+        case ENoProfile:
+        case ECoreProfile:
+        case ECompatibilityProfile:
+            return spv::SourceLanguageGLSL;
+        case EEsProfile:
+            return spv::SourceLanguageESSL;
+        default:
+            return spv::SourceLanguageUnknown;
+        }
+    case glslang::EShSourceHlsl:
+        return spv::SourceLanguageHLSL;
     default:
         return spv::SourceLanguageUnknown;
     }
@@ -587,11 +616,11 @@ TGlslangToSpvTraverser::TGlslangToSpvTraverser(const glslang::TIntermediate* gls
     spv::ExecutionModel executionModel = TranslateExecutionModel(glslangIntermediate->getStage());
 
     builder.clearAccessChain();
-    builder.setSource(TranslateSourceLanguage(glslangIntermediate->getProfile()), glslangIntermediate->getVersion());
+    builder.setSource(TranslateSourceLanguage(glslangIntermediate->getSource(), glslangIntermediate->getProfile()), glslangIntermediate->getVersion());
     stdBuiltins = builder.import("GLSL.std.450");
     builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
-    shaderEntry = builder.makeMain();
-    entryPoint = builder.addEntryPoint(executionModel, shaderEntry, "main");
+    shaderEntry = builder.makeEntrypoint(glslangIntermediate->getEntryPoint().c_str());
+    entryPoint = builder.addEntryPoint(executionModel, shaderEntry, glslangIntermediate->getEntryPoint().c_str());
 
     // Add the source extensions
     const auto& sourceExtensions = glslangIntermediate->getRequestedExtensions();
@@ -749,6 +778,10 @@ TGlslangToSpvTraverser::~TGlslangToSpvTraverser()
 //
 void TGlslangToSpvTraverser::visitSymbol(glslang::TIntermSymbol* symbol)
 {
+    SpecConstantOpModeGuard spec_constant_op_mode_setter(&builder);
+    if (symbol->getType().getQualifier().isSpecConstant())
+        spec_constant_op_mode_setter.turnOnSpecConstantOpMode();
+
     // getSymbolId() will set up all the IO decorations on the first call.
     // Formal function parameters were mapped during makeFunctions().
     spv::Id id = getSymbolId(symbol);
@@ -786,6 +819,10 @@ void TGlslangToSpvTraverser::visitSymbol(glslang::TIntermSymbol* symbol)
 
 bool TGlslangToSpvTraverser::visitBinary(glslang::TVisit /* visit */, glslang::TIntermBinary* node)
 {
+    SpecConstantOpModeGuard spec_constant_op_mode_setter(&builder);
+    if (node->getType().getQualifier().isSpecConstant())
+        spec_constant_op_mode_setter.turnOnSpecConstantOpMode();
+
     // First, handle special cases
     switch (node->getOp()) {
     case glslang::EOpAssign:
@@ -958,6 +995,10 @@ bool TGlslangToSpvTraverser::visitBinary(glslang::TVisit /* visit */, glslang::T
 
 bool TGlslangToSpvTraverser::visitUnary(glslang::TVisit /* visit */, glslang::TIntermUnary* node)
 {
+    SpecConstantOpModeGuard spec_constant_op_mode_setter(&builder);
+    if (node->getType().getQualifier().isSpecConstant())
+        spec_constant_op_mode_setter.turnOnSpecConstantOpMode();
+
     spv::Id result = spv::NoResult;
 
     // try texturing first
@@ -1520,7 +1561,7 @@ bool TGlslangToSpvTraverser::visitSwitch(glslang::TVisit /* visit */, glslang::T
 void TGlslangToSpvTraverser::visitConstantUnion(glslang::TIntermConstantUnion* node)
 {
     int nextConst = 0;
-    spv::Id constant = createSpvConstant(node->getType(), node->getConstArray(), nextConst, false);
+    spv::Id constant = createSpvConstantFromConstUnionArray(node->getType(), node->getConstArray(), nextConst, false);
 
     builder.clearAccessChain();
     builder.setAccessChainRValue(constant);
@@ -1630,7 +1671,7 @@ spv::Id TGlslangToSpvTraverser::createSpvVariable(const glslang::TIntermSymbol* 
     // can still have a mapping to a SPIR-V Id.
     // This includes specialization constants.
     if (node->getQualifier().isConstant()) {
-        return createSpvSpecConstant(*node);
+        return createSpvConstant(*node);
     }
 
     // Now, handle actual variables
@@ -2082,7 +2123,9 @@ void TGlslangToSpvTraverser::updateMemberOffset(const glslang::TType& /*structTy
 
 bool TGlslangToSpvTraverser::isShaderEntrypoint(const glslang::TIntermAggregate* node)
 {
-    return node->getName() == "main(";
+    // have to ignore mangling and just look at the base name
+    size_t firstOpen = node->getName().find('(');
+    return node->getName().compare(0, firstOpen, glslangIntermediate->getEntryPoint().c_str()) == 0;
 }
 
 // Make all the functions, skeletally, without actually visiting their bodies.
@@ -3264,6 +3307,15 @@ spv::Id TGlslangToSpvTraverser::createConversion(glslang::TOperator op, spv::Dec
 
     case glslang::EOpConvUintToInt:
     case glslang::EOpConvIntToUint:
+        if (builder.isInSpecConstCodeGenMode()) {
+            // Build zero scalar or vector for OpIAdd.
+            zero = builder.makeUintConstant(0);
+            zero = makeSmearedConstant(zero, vectorSize);
+            // Use OpIAdd, instead of OpBitcast to do the conversion when
+            // generating for OpSpecConstantOp instruction.
+            return builder.createBinOp(spv::OpIAdd, destType, operand, zero);
+        }
+        // For normal run-time conversion instruction, use OpBitcast.
         convOp = spv::OpBitcast;
         break;
 
@@ -3730,43 +3782,50 @@ void TGlslangToSpvTraverser::addMemberDecoration(spv::Id id, int member, spv::De
 // recursively walks.  So, this function walks the "top" of the tree:
 //  - emit specialization constant-building instructions for specConstant
 //  - when running into a non-spec-constant, switch to createSpvConstant()
-spv::Id TGlslangToSpvTraverser::createSpvSpecConstant(const glslang::TIntermTyped& node)
+spv::Id TGlslangToSpvTraverser::createSpvConstant(const glslang::TIntermTyped& node)
 {
     assert(node.getQualifier().isConstant());
 
+    // Handle front-end constants first (non-specialization constants).
     if (! node.getQualifier().specConstant) {
         // hand off to the non-spec-constant path
         assert(node.getAsConstantUnion() != nullptr || node.getAsSymbolNode() != nullptr);
         int nextConst = 0;
-        return createSpvConstant(node.getType(), node.getAsConstantUnion() ? node.getAsConstantUnion()->getConstArray() : node.getAsSymbolNode()->getConstArray(),
+        return createSpvConstantFromConstUnionArray(node.getType(), node.getAsConstantUnion() ? node.getAsConstantUnion()->getConstArray() : node.getAsSymbolNode()->getConstArray(),
                                  nextConst, false);
     }
 
     // We now know we have a specialization constant to build
 
-    if (node.getAsSymbolNode() && node.getQualifier().hasSpecConstantId()) {
-        // this is a direct literal assigned to a layout(constant_id=) declaration
-        int nextConst = 0;
-        return createSpvConstant(node.getType(), node.getAsConstantUnion() ? node.getAsConstantUnion()->getConstArray() : node.getAsSymbolNode()->getConstArray(),
-                                 nextConst, true);
-    } else {
-        // gl_WorkgroupSize is a special case until the front-end handles hierarchical specialization constants,
-        // even then, it's specialization ids are handled by special case syntax in GLSL: layout(local_size_x = ...
-        if (node.getType().getQualifier().builtIn == glslang::EbvWorkGroupSize) {
-            std::vector<spv::Id> dimConstId;
-            for (int dim = 0; dim < 3; ++dim) {
-                bool specConst = (glslangIntermediate->getLocalSizeSpecId(dim) != glslang::TQualifier::layoutNotSet);
-                dimConstId.push_back(builder.makeUintConstant(glslangIntermediate->getLocalSize(dim), specConst));
-                if (specConst)
-                    addDecoration(dimConstId.back(), spv::DecorationSpecId, glslangIntermediate->getLocalSizeSpecId(dim));
-            }
-            return builder.makeCompositeConstant(builder.makeVectorType(builder.makeUintType(32), 3), dimConstId, true);
-        } else {
-            spv::MissingFunctionality("specialization-constant expression trees");
-            exit(1);
-            return spv::NoResult;
+    // gl_WorkgroupSize is a special case until the front-end handles hierarchical specialization constants,
+    // even then, it's specialization ids are handled by special case syntax in GLSL: layout(local_size_x = ...
+    if (node.getType().getQualifier().builtIn == glslang::EbvWorkGroupSize) {
+        std::vector<spv::Id> dimConstId;
+        for (int dim = 0; dim < 3; ++dim) {
+            bool specConst = (glslangIntermediate->getLocalSizeSpecId(dim) != glslang::TQualifier::layoutNotSet);
+            dimConstId.push_back(builder.makeUintConstant(glslangIntermediate->getLocalSize(dim), specConst));
+            if (specConst)
+                addDecoration(dimConstId.back(), spv::DecorationSpecId, glslangIntermediate->getLocalSizeSpecId(dim));
+        }
+        return builder.makeCompositeConstant(builder.makeVectorType(builder.makeUintType(32), 3), dimConstId, true);
+    }
+
+    // An AST node labelled as specialization constant should be a symbol node.
+    // Its initializer should either be a sub tree with constant nodes, or a constant union array.
+    if (auto* sn = node.getAsSymbolNode()) {
+        if (auto* sub_tree = sn->getConstSubtree()) {
+            return createSpvConstantFromConstSubTree(sub_tree);
+        } else if (auto* const_union_array = &sn->getConstArray()){
+            int nextConst = 0;
+            return createSpvConstantFromConstUnionArray(sn->getType(), *const_union_array, nextConst, true);
         }
     }
+
+    // Neither a front-end constant node, nor a specialization constant node with constant union array or
+    // constant sub tree as initializer.
+    spv::MissingFunctionality("Neither a front-end constant nor a spec constant.");
+    exit(1);
+    return spv::NoResult;
 }
 
 // Use 'consts' as the flattened glslang source of scalar constants to recursively
@@ -3775,7 +3834,7 @@ spv::Id TGlslangToSpvTraverser::createSpvSpecConstant(const glslang::TIntermType
 // If there are not enough elements present in 'consts', 0 will be substituted;
 // an empty 'consts' can be used to create a fully zeroed SPIR-V constant.
 //
-spv::Id TGlslangToSpvTraverser::createSpvConstant(const glslang::TType& glslangType, const glslang::TConstUnionArray& consts, int& nextConst, bool specConstant)
+spv::Id TGlslangToSpvTraverser::createSpvConstantFromConstUnionArray(const glslang::TType& glslangType, const glslang::TConstUnionArray& consts, int& nextConst, bool specConstant)
 {
     // vector of constants for SPIR-V
     std::vector<spv::Id> spvConsts;
@@ -3786,15 +3845,15 @@ spv::Id TGlslangToSpvTraverser::createSpvConstant(const glslang::TType& glslangT
     if (glslangType.isArray()) {
         glslang::TType elementType(glslangType, 0);
         for (int i = 0; i < glslangType.getOuterArraySize(); ++i)
-            spvConsts.push_back(createSpvConstant(elementType, consts, nextConst, false));
+            spvConsts.push_back(createSpvConstantFromConstUnionArray(elementType, consts, nextConst, false));
     } else if (glslangType.isMatrix()) {
         glslang::TType vectorType(glslangType, 0);
         for (int col = 0; col < glslangType.getMatrixCols(); ++col)
-            spvConsts.push_back(createSpvConstant(vectorType, consts, nextConst, false));
+            spvConsts.push_back(createSpvConstantFromConstUnionArray(vectorType, consts, nextConst, false));
     } else if (glslangType.getStruct()) {
         glslang::TVector<glslang::TTypeLoc>::const_iterator iter;
         for (iter = glslangType.getStruct()->begin(); iter != glslangType.getStruct()->end(); ++iter)
-            spvConsts.push_back(createSpvConstant(*iter->type, consts, nextConst, false));
+            spvConsts.push_back(createSpvConstantFromConstUnionArray(*iter->type, consts, nextConst, false));
     } else if (glslangType.isVector()) {
         for (unsigned int i = 0; i < (unsigned int)glslangType.getVectorSize(); ++i) {
             bool zero = nextConst >= consts.size();
@@ -3849,6 +3908,68 @@ spv::Id TGlslangToSpvTraverser::createSpvConstant(const glslang::TType& glslangT
     }
 
     return builder.makeCompositeConstant(typeId, spvConsts);
+}
+
+// Create constant ID from const initializer sub tree.
+spv::Id TGlslangToSpvTraverser::createSpvConstantFromConstSubTree(
+    glslang::TIntermTyped* subTree)
+{
+    const glslang::TType& glslangType = subTree->getType();
+    spv::Id typeId = convertGlslangToSpvType(glslangType);
+    bool is_spec_const = subTree->getType().getQualifier().isSpecConstant();
+    if (const glslang::TIntermAggregate* an = subTree->getAsAggregate()) {
+        // Aggregate node, we should generate OpConstantComposite or
+        // OpSpecConstantComposite instruction.
+
+        std::vector<spv::Id> const_constituents;
+        for (auto NI = an->getSequence().begin(); NI != an->getSequence().end();
+             NI++) {
+            const_constituents.push_back(
+                createSpvConstantFromConstSubTree((*NI)->getAsTyped()));
+        }
+        // Note that constructors are aggregate nodes, so expressions like:
+        // float x = float(y) will become an aggregate node. If 'x' is declared
+        // as a constant, the aggregate node representing 'float(y)' will be
+        // processed here.
+        if (builder.isVectorType(typeId) || builder.isMatrixType(typeId) ||
+            builder.isAggregateType(typeId)) {
+            return builder.makeCompositeConstant(typeId, const_constituents, is_spec_const);
+        } else {
+            assert(builder.isScalarType(typeId) && const_constituents.size() == 1);
+            return const_constituents.front();
+        }
+
+    } else if (glslang::TIntermBinary* bn = subTree->getAsBinaryNode()) {
+        // Binary operation node, we should generate OpSpecConstantOp <binary op>
+        // This case should only happen when Specialization Constants are involved.
+        bn->traverse(this);
+        return accessChainLoad(bn->getType());
+
+    } else if (glslang::TIntermUnary* un = subTree->getAsUnaryNode()) {
+        // Unary operation node, similar to binary operation node, should only
+        // happen when specialization constants are involved.
+        un->traverse(this);
+        return accessChainLoad(un->getType());
+
+    } else if (const glslang::TIntermConstantUnion* cn = subTree->getAsConstantUnion()) {
+        // ConstantUnion node, should redirect to
+        // createSpvConstantFromConstUnionArray
+        int nextConst = 0;
+        return createSpvConstantFromConstUnionArray(
+            glslangType, cn->getConstArray(), nextConst, is_spec_const);
+
+    } else if (const glslang::TIntermSymbol* sn = subTree->getAsSymbolNode()) {
+        // Symbol node. Call getSymbolId(). This should cover both cases 1) the
+        // symbol has already been assigned an ID, 2) need a new ID for this
+        // symbol.
+        return getSymbolId(sn);
+
+    } else {
+        spv::MissingFunctionality(
+            "createSpvConstantFromConstSubTree() not covered TIntermTyped* const "
+            "initializer subtree.");
+        return spv::NoResult;
+    }
 }
 
 // Return true if the node is a constant or symbol whose reading has no
