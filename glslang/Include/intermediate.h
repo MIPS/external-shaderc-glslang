@@ -515,7 +515,29 @@ enum TOperator {
     EOpInterlockedMin,      // ...
     EOpInterlockedOr,       // ...
     EOpInterlockedXor,      // ...
+    EOpAllMemoryBarrierWithGroupSync,    // memory barriers without non-hlsl AST equivalents
+    EOpGroupMemoryBarrierWithGroupSync,  // ...
+    EOpWorkgroupMemoryBarrier,           // ...
+    EOpWorkgroupMemoryBarrierWithGroupSync, // ...
+    EOpEvaluateAttributeSnapped,         // InterpolateAtOffset with int position on 16x16 grid
+    EOpF32tof16,                         // HLSL conversion: half of a PackHalf2x16
+    EOpF16tof32,                         // HLSL conversion: half of an UnpackHalf2x16
+    EOpLit,                              // HLSL lighting coefficient vector
+    EOpTextureBias,                      // HLSL texture bias: will be lowered to EOpTexture
+    EOpAsDouble,                         // slightly different from EOpUint64BitsToDouble
 
+    EOpMethodSample,                     // Texture object methods.  These are translated to existing
+    EOpMethodSampleBias,                 // AST methods, and exist to represent HLSL semantics until that
+    EOpMethodSampleCmp,                  // translation is performed.  See HlslParseContext::decomposeSampleMethods().
+    EOpMethodSampleCmpLevelZero,         // ...
+    EOpMethodSampleGrad,                 // ...
+    EOpMethodSampleLevel,                // ...
+    EOpMethodLoad,                       // ...
+    EOpMethodGetDimensions,              // ...
+    EOpMethodGetSamplePosition,          // ...
+    EOpMethodGather,                     // ...
+    EOpMethodCalculateLevelOfDetail,     // ...
+    EOpMethodCalculateLevelOfDetailUnclamped,     // ...
 };
 
 class TIntermTraverser;
@@ -570,7 +592,10 @@ public:
     virtual const glslang::TIntermSymbol*        getAsSymbolNode()    const { return 0; }
     virtual const glslang::TIntermBranch*        getAsBranchNode()    const { return 0; }
     virtual ~TIntermNode() { }
+
 protected:
+    TIntermNode(const TIntermNode&);
+    TIntermNode& operator=(const TIntermNode&);
     glslang::TSourceLoc loc;
 };
 
@@ -612,6 +637,7 @@ public:
     TString getCompleteString() const { return type.getCompleteString(); }
 
 protected:
+    TIntermTyped& operator=(const TIntermTyped&);
     TType type;
 };
 
@@ -693,6 +719,7 @@ public:
     const TConstUnionArray& getConstArray() const { return constArray; }
     void setConstSubtree(TIntermTyped* subtree) { constSubtree = subtree; }
     TIntermTyped* getConstSubtree() const { return constSubtree; }
+
 protected:
     int id;                      // the unique id of the symbol this node represents
     TString name;                // the name of the symbol this node represents
@@ -712,7 +739,10 @@ public:
     void setLiteral() { literal = true; }
     void setExpression() { literal = false; }
     bool isLiteral() const { return literal; }
+
 protected:
+    TIntermConstantUnion& operator=(const TIntermConstantUnion&);
+
     const TConstUnionArray constArray;
     bool literal;  // true if node represents a literal in the source code
 };

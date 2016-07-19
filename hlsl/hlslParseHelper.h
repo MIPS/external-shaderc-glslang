@@ -60,8 +60,8 @@ public:
     void C_DECL ppWarn(const TSourceLoc&, const char* szReason, const char* szToken,
         const char* szExtraInfoFormat, ...);
 
-    void reservedPpErrorCheck(const TSourceLoc&, const char* name, const char* op) { }
-    bool lineContinuationCheck(const TSourceLoc&, bool endOfComment) { return true; }
+    void reservedPpErrorCheck(const TSourceLoc&, const char* /*name*/, const char* /*op*/) { }
+    bool lineContinuationCheck(const TSourceLoc&, bool /*endOfComment*/) { return true; }
     bool lineDirectiveShouldSetNextLine() const { return true; }
     bool builtInName(const TString&);
 
@@ -87,12 +87,15 @@ public:
     void handleFunctionArgument(TFunction*, TIntermTyped*& arguments, TIntermTyped* newArg);
     TIntermTyped* handleFunctionCall(const TSourceLoc&, TFunction*, TIntermNode*);
     void decomposeIntrinsic(const TSourceLoc&, TIntermTyped*& node, TIntermNode* arguments);
+    void decomposeSampleMethods(const TSourceLoc&, TIntermTyped*& node, TIntermNode* arguments);
     TIntermTyped* handleLengthMethod(const TSourceLoc&, TFunction*, TIntermNode*);
     void addInputArgumentConversions(const TFunction&, TIntermNode*&) const;
     TIntermTyped* addOutputArgumentConversions(const TFunction&, TIntermAggregate&) const;
     void builtInOpCheck(const TSourceLoc&, const TFunction&, TIntermOperator&);
     TFunction* handleConstructorCall(const TSourceLoc&, const TType&);
     void handleSemantic(TType& type, const TString& semantic);
+
+    TIntermAggregate* handleSamplerTextureCombine(const TSourceLoc& loc, TIntermTyped* argTex, TIntermTyped* argSampler);
 
     bool parseVectorFields(const TSourceLoc&, const TString&, int vecSize, TVectorFields&);
     void assignError(const TSourceLoc&, const char* op, TString left, TString right);
@@ -125,6 +128,7 @@ public:
     void checkNoShaderLayouts(const TSourceLoc&, const TShaderQualifiers&);
 
     const TFunction* findFunction(const TSourceLoc& loc, const TFunction& call, bool& builtIn);
+    void declareTypedef(const TSourceLoc&, TString& identifier, const TType&, TArraySizes* typeArray = 0);
     TIntermNode* declareVariable(const TSourceLoc&, TString& identifier, const TType&, TArraySizes* typeArray = 0, TIntermTyped* initializer = 0);
     TIntermTyped* addConstructor(const TSourceLoc&, TIntermNode*, const TType&, TOperator);
     TIntermTyped* constructAggregate(TIntermNode*, const TType&, int, const TSourceLoc&);
@@ -146,6 +150,9 @@ public:
     void pushScope()       { symbolTable.push(); }
     void popScope()        { symbolTable.pop(0); }
 
+    void pushSwitchSequence(TIntermSequence* sequence) { switchSequenceStack.push_back(sequence); }
+    void popSwitchSequence() { switchSequenceStack.pop_back(); }
+
 protected:
     void inheritGlobalDefaults(TQualifier& dst) const;
     TVariable* makeInternalVariable(const char* name, const TType&) const;
@@ -165,7 +172,6 @@ protected:
     int structNestingLevel;      // 0 if outside blocks and structures
     int controlFlowNestingLevel; // 0 if outside all flow control
     TList<TIntermSequence*> switchSequenceStack;  // case, node, case, case, node, ...; ensure only one node between cases;   stack of them for nesting
-    TList<int> switchLevel;      // the statementNestingLevel the current switch statement is at, which must match the level of its case statements
     bool inEntrypoint;           // if inside a function, true if the function is the entry point
     bool postMainReturn;         // if inside a function, true if the function is the entry point and this is after a return statement
     const TType* currentFunctionType;  // the return type of the function that's currently being parsed

@@ -377,6 +377,9 @@ void C_DECL TParseContext::error(const TSourceLoc& loc, const char* szReason, co
     va_start(args, szExtraInfoFormat);
     outputMessage(loc, szReason, szToken, szExtraInfoFormat, EPrefixError, args);
     va_end(args);
+
+    if ((messages & EShMsgCascadingErrors) == 0)
+        currentScanner->setEndOfInput();
 }
 
 void C_DECL TParseContext::warn(const TSourceLoc& loc, const char* szReason, const char* szToken,
@@ -397,6 +400,9 @@ void C_DECL TParseContext::ppError(const TSourceLoc& loc, const char* szReason, 
     va_start(args, szExtraInfoFormat);
     outputMessage(loc, szReason, szToken, szExtraInfoFormat, EPrefixError, args);
     va_end(args);
+
+    if ((messages & EShMsgCascadingErrors) == 0)
+        currentScanner->setEndOfInput();
 }
 
 void C_DECL TParseContext::ppWarn(const TSourceLoc& loc, const char* szReason, const char* szToken,
@@ -1199,6 +1205,28 @@ TIntermTyped* TParseContext::handleFunctionCall(const TSourceLoc& loc, TFunction
     return result;
 }
 
+TIntermNode* TParseContext::handleReturnValue(const TSourceLoc& loc, TIntermTyped* value)
+{
+    functionReturnsValue = true;
+    if (currentFunctionType->getBasicType() == EbtVoid) {
+        error(loc, "void function cannot return a value", "return", "");
+        return intermediate.addBranch(EOpReturn, loc);
+    } else if (*currentFunctionType != value->getType()) {
+        TIntermTyped* converted = intermediate.addConversion(EOpReturn, *currentFunctionType, value);
+        if (converted) {
+            if (*currentFunctionType != converted->getType())
+                error(loc, "cannot convert return value to function return type", "return", "");
+            if (version < 420)
+                warn(loc, "type conversion on return values was not explicitly allowed until version 420", "return", "");
+            return intermediate.addBranch(EOpReturn, converted, loc);
+        } else {
+            error(loc, "type does not match, or is not convertible to, the function's return type", "return", "");
+            return intermediate.addBranch(EOpReturn, value, loc);
+        }
+    } else
+        return intermediate.addBranch(EOpReturn, value, loc);
+}
+
 // See if the operation is being done in an illegal location.
 void TParseContext::checkLocation(const TSourceLoc& loc, TOperator op)
 {
@@ -1908,7 +1936,13 @@ void TParseContext::variableCheck(TIntermTyped*& nodePtr)
         return;
 
     if (symbol->getType().getBasicType() == EbtVoid) {
-        error(symbol->getLoc(), "undeclared identifier", symbol->getName().c_str(), "");
+        const char *extraInfoFormat = "";
+        if (spvVersion.vulkan != 0 && symbol->getName() == "gl_VertexID") {
+          extraInfoFormat = "(Did you mean gl_VertexIndex?)";
+        } else if (spvVersion.vulkan != 0 && symbol->getName() == "gl_InstanceID") {
+          extraInfoFormat = "(Did you mean gl_InstanceIndex?)";
+        }
+        error(symbol->getLoc(), "undeclared identifier", symbol->getName().c_str(), extraInfoFormat);
 
         // Add to symbol table to prevent future error messages on the same name
         if (symbol->getName().size() > 0) {
@@ -3141,12 +3175,13 @@ void TParseContext::arrayDimMerge(TType& type, const TArraySizes* sizes)
 //
 void TParseContext::declareArray(const TSourceLoc& loc, TString& identifier, const TType& type, TSymbol*& symbol, bool& newDeclaration)
 {
-    if (! symbol) {
+    if (symbol == nullptr) {
         bool currentScope;
         symbol = symbolTable.find(identifier, nullptr, &currentScope);
 
         if (symbol && builtInName(identifier) && ! symbolTable.atBuiltInLevel()) {
             // bad shader (errors already reported) trying to redeclare a built-in name as an array
+            symbol = nullptr;
             return;
         }
         if (symbol == nullptr || ! currentScope) {
@@ -3179,7 +3214,7 @@ void TParseContext::declareArray(const TSourceLoc& loc, TString& identifier, con
     // Process a redeclaration.
     //
 
-    if (! symbol) {
+    if (symbol == nullptr) {
         error(loc, "array variable name expected", identifier.c_str(), "");
         return;
     }
@@ -3824,7 +3859,7 @@ void TParseContext::arrayLimitCheck(const TSourceLoc& loc, const TString& identi
         limitCheck(loc, size, "gl_MaxCullDistances", "gl_CullDistance array size");
 }
 
-// See if the provided value is less than the symbol indicated by limit,
+// See if the provided value is less than or equal to the symbol indicated by limit,
 // which should be a constant in the symbol table.
 void TParseContext::limitCheck(const TSourceLoc& loc, int value, const char* limit, const char* feature)
 {
@@ -3832,8 +3867,8 @@ void TParseContext::limitCheck(const TSourceLoc& loc, int value, const char* lim
     assert(symbol->getAsVariable());
     const TConstUnionArray& constArray = symbol->getAsVariable()->getConstArray();
     assert(! constArray.empty());
-    if (value >= constArray[0].getIConst())
-        error(loc, "must be less than", feature, "%s (%d)", limit, constArray[0].getIConst());
+    if (value > constArray[0].getIConst())
+        error(loc, "must be less than or equal to", feature, "%s (%d)", limit, constArray[0].getIConst());
 }
 
 //
@@ -4081,7 +4116,10 @@ void TParseContext::setLayoutQualifier(const TSourceLoc& loc, TPublicType& publi
     std::transform(id.begin(), id.end(), id.begin(), ::tolower);
     
     if (id == "offset") {
-        const char* feature = "uniform offset";
+        // "offset" can be for either
+        //  - uniform offsets
+        //  - atomic_uint offsets
+        const char* feature = "offset";
         requireProfile(loc, EEsProfile | ECoreProfile | ECompatibilityProfile, feature);
         const char* exts[2] = { E_GL_ARB_enhanced_layouts, E_GL_ARB_shader_atomic_counters };
         profileRequires(loc, ECoreProfile | ECompatibilityProfile, 420, 2, exts, feature);
@@ -4112,6 +4150,8 @@ void TParseContext::setLayoutQualifier(const TSourceLoc& loc, TPublicType& publi
             error(loc, "set is too large", id.c_str(), "");
         else
             publicType.qualifier.layoutSet = value;
+        if (value != 0)
+            requireVulkan(loc, "descriptor set");
         return;
     } else if (id == "binding") {
         profileRequires(loc, ~EEsProfile, 420, E_GL_ARB_shading_language_420pack, "binding");
@@ -4713,8 +4753,18 @@ void TParseContext::fixOffset(const TSourceLoc& loc, TSymbol& symbol)
 
             // Check for overlap
             int numOffsets = 4;
-            if (symbol.getType().isArray())
-                numOffsets *= symbol.getType().getCumulativeArraySize();
+            if (symbol.getType().isArray()) {
+                if (symbol.getType().isExplicitlySizedArray())
+                    numOffsets *= symbol.getType().getCumulativeArraySize();
+                else {
+                    // TODO: functionality: implicitly-sized atomic_uint arrays.
+                    // We don't know the full size until later.  This might
+                    // be a specification problem, will report to Khronos.  For the
+                    // cases that is not true, the rest of the checking would need
+                    // to be done at link time instead of compile time.
+                    warn(loc, "implicitly sized atomic_uint array treated as having one element for tracking the default offset", "atomic_uint", "");
+                }
+            }
             int repeated = intermediate.addUsedOffsets(qualifier.layoutBinding, offset, numOffsets);
             if (repeated >= 0)
                 error(loc, "atomic counters sharing the same offset:", "offset", "%d", repeated);
@@ -4895,7 +4945,7 @@ TIntermNode* TParseContext::declareVariable(const TSourceLoc& loc, TString& iden
     // Check for redeclaration of built-ins and/or attempting to declare a reserved name
     bool newDeclaration = false;    // true if a new entry gets added to the symbol table
     TSymbol* symbol = redeclareBuiltinVariable(loc, identifier, type.getQualifier(), publicType.shaderQualifiers, newDeclaration);
-    if (! symbol)
+    if (symbol == nullptr)
         reservedErrorCheck(loc, identifier);
 
     inheritGlobalDefaults(type.getQualifier());
@@ -4920,18 +4970,18 @@ TIntermNode* TParseContext::declareVariable(const TSourceLoc& loc, TString& iden
         }
     } else {
         // non-array case
-        if (! symbol)
+        if (symbol == nullptr)
             symbol = declareNonArray(loc, identifier, type, newDeclaration);
         else if (type != symbol->getType())
             error(loc, "cannot change the type of", "redeclaration", symbol->getName().c_str());
     }
 
-    if (! symbol)
+    if (symbol == nullptr)
         return nullptr;
 
     // Deal with initializer
     TIntermNode* initNode = nullptr;
-    if (symbol && initializer) {
+    if (symbol != nullptr && initializer) {
         TVariable* variable = symbol->getAsVariable();
         if (! variable) {
             error(loc, "initializer requires a variable, not a member", identifier.c_str(), "");
