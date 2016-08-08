@@ -86,6 +86,7 @@ struct TSampler {   // misnomer now; includes images, textures without sampler, 
     bool isTexture()     const { return !sampler && !image; }
     bool isShadow()      const { return shadow; }
     bool isArrayed()     const { return arrayed; }
+    bool isMultiSample() const { return ms; }
 
     void clear()
     {
@@ -405,6 +406,9 @@ public:
         smooth       = false;
         flat         = false;
         nopersp      = false;
+#ifdef AMD_EXTENSIONS
+        explicitInterp = false;
+#endif
         patch        = false;
         sample       = false;
         coherent     = false;
@@ -438,6 +442,9 @@ public:
     bool smooth       : 1;
     bool flat         : 1;
     bool nopersp      : 1;
+#ifdef AMD_EXTENSIONS
+    bool explicitInterp : 1;
+#endif
     bool patch        : 1;
     bool sample       : 1;
     bool coherent     : 1;
@@ -453,7 +460,11 @@ public:
     }
     bool isInterpolation() const
     {
+#ifdef AMD_EXTENSIONS
+        return flat || smooth || nopersp || explicitInterp;
+#else
         return flat || smooth || nopersp;
+#endif
     }
     bool isAuxiliary() const
     {
@@ -1518,6 +1529,10 @@ public:
             p += snprintf(p, end - p, "flat ");
         if (qualifier.nopersp)
             p += snprintf(p, end - p, "noperspective ");
+#ifdef AMD_EXTENSIONS
+        if (qualifier.explicitInterp)
+            p += snprintf(p, end - p, "__explicitInterpAMD ");
+#endif
         if (qualifier.patch)
             p += snprintf(p, end - p, "patch ");
         if (qualifier.sample)
