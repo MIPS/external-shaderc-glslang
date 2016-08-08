@@ -88,6 +88,14 @@ HlslParseContext::~HlslParseContext()
 {
 }
 
+void HlslParseContext::initializeExtensionBehavior()
+{
+    TParseContextBase::initializeExtensionBehavior();
+
+    // HLSL allows #line by default.
+    extensionBehavior[E_GL_GOOGLE_cpp_style_line_directive] = EBhEnable;
+}
+
 void HlslParseContext::setLimits(const TBuiltInResource& r)
 {
     resources = r;
@@ -573,6 +581,15 @@ TIntermTyped* HlslParseContext::handleDotDereference(const TSourceLoc& loc, TInt
     } else if (field == "CalculateLevelOfDetail"          ||
                field == "CalculateLevelOfDetailUnclamped" ||
                field == "Gather"                          ||
+               field == "GatherRed"                       ||
+               field == "GatherGreen"                     ||
+               field == "GatherBlue"                      ||
+               field == "GatherAlpha"                     ||
+               field == "GatherCmp"                       ||
+               field == "GatherCmpRed"                    ||
+               field == "GatherCmpGreen"                  ||
+               field == "GatherCmpBlue"                   ||
+               field == "GatherCmpAlpha"                  ||
                field == "GetDimensions"                   ||
                field == "GetSamplePosition"               ||
                field == "Load"                            ||
@@ -616,7 +633,7 @@ TIntermTyped* HlslParseContext::handleDotDereference(const TSourceLoc& loc, TInt
                 return result;
             else {
                 TType type(base->getBasicType(), EvqTemporary, fields.num);
-                return addConstructor(loc, base, type, mapTypeToConstructorOp(type));
+                return addConstructor(loc, base, type);
             }
         }
 
@@ -626,7 +643,7 @@ TIntermTyped* HlslParseContext::handleDotDereference(const TSourceLoc& loc, TInt
             if (fields.num == 1) {
                 TIntermTyped* index = intermediate.addConstantUnion(fields.offsets[0], loc);
                 result = intermediate.addIndex(EOpIndexDirect, base, index, loc);
-                result->setType(TType(base->getBasicType(), EvqTemporary, base->getType().getQualifier().precision));
+                result->setType(TType(base->getBasicType(), EvqTemporary));
             } else {
                 TString vectorString = field;
                 TIntermTyped* index = intermediate.addSwizzle(fields, loc);
@@ -825,6 +842,7 @@ TIntermAggregate* HlslParseContext::handleSamplerTextureCombine(const TSourceLoc
 
     TSampler samplerType = argTex->getType().getSampler();
     samplerType.combined = true;
+    samplerType.shadow   = argSampler->getType().getSampler().shadow;
 
     txcombine->setType(TType(samplerType, EvqTemporary));
     txcombine->setLoc(loc);
@@ -980,7 +998,7 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
 
             const TSampler& texSampler = texType.getSampler();
             const TSamplerDim dim = texSampler.dim;
-            const int numArgs = argAggregate->getSequence().size();
+            const int numArgs = (int) argAggregate->getSequence().size();
 
             int numDims = 0;
 
@@ -998,7 +1016,7 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
                 ++numDims;
 
             // Establish whether we're querying mip levels
-            const bool mipQuery = numArgs > (numDims + 1);
+            const bool mipQuery = (numArgs > (numDims + 1)) && (!texSampler.isMultiSample());
 
             // AST assumes integer return.  Will be converted to float if required.
             TIntermAggregate* sizeQuery = new TIntermAggregate(EOpTextureQuerySize);
@@ -1054,12 +1072,370 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
                 compoundStatement = intermediate.growAggregate(compoundStatement, compAssign);
             }
 
+            // 2DMS formats query # samples, which needs a different query op
+            if (texSampler.isMultiSample()) {
+                TIntermTyped* outParam = argAggregate->getSequence()[outParamBase + numDims]->getAsTyped();
+
+                TIntermAggregate* samplesQuery = new TIntermAggregate(EOpImageQuerySamples);
+                samplesQuery->getSequence().push_back(argTex);
+                samplesQuery->setType(TType(EbtUint, EvqTemporary, 1));
+                samplesQuery->setLoc(loc);
+                
+                TIntermTyped* compAssign = intermediate.addAssign(EOpAssign, outParam, samplesQuery, loc);
+                compoundStatement = intermediate.growAggregate(compoundStatement, compAssign);
+            }
+
             compoundStatement->setOperator(EOpSequence);
             compoundStatement->setLoc(loc);
             compoundStatement->setType(TType(EbtVoid));
 
             node = compoundStatement;
 
+            break;
+        }
+
+    case EOpMethodSampleCmp:  // fall through...
+    case EOpMethodSampleCmpLevelZero:
+        {
+            TIntermTyped* argTex    = argAggregate->getSequence()[0]->getAsTyped();
+            TIntermTyped* argSamp   = argAggregate->getSequence()[1]->getAsTyped();
+            TIntermTyped* argCoord  = argAggregate->getSequence()[2]->getAsTyped();
+            TIntermTyped* argCmpVal = argAggregate->getSequence()[3]->getAsTyped();
+            TIntermTyped* argOffset = nullptr;
+
+            // optional offset value
+            if (argAggregate->getSequence().size() > 4)
+                argOffset = argAggregate->getSequence()[4]->getAsTyped();
+            
+            const int coordDimWithCmpVal = argCoord->getType().getVectorSize() + 1; // +1 for cmp
+
+            // AST wants comparison value as one of the texture coordinates
+            TOperator constructOp = EOpNull;
+            switch (coordDimWithCmpVal) {
+            // 1D can't happen: there's always at least 1 coordinate dimension + 1 cmp val
+            case 2: constructOp = EOpConstructVec2;  break;
+            case 3: constructOp = EOpConstructVec3;  break;
+            case 4: constructOp = EOpConstructVec4;  break;
+            case 5: constructOp = EOpConstructVec4;  break; // cubeArrayShadow, cmp value is separate arg.
+            default: assert(0); break;
+            }
+
+            TIntermAggregate* coordWithCmp = new TIntermAggregate(constructOp);
+            coordWithCmp->getSequence().push_back(argCoord);
+            if (coordDimWithCmpVal != 5) // cube array shadow is special.
+                coordWithCmp->getSequence().push_back(argCmpVal);
+            coordWithCmp->setLoc(loc);
+
+            TOperator textureOp = (op == EOpMethodSampleCmpLevelZero ? EOpTextureLod : EOpTexture);
+            if (argOffset != nullptr)
+                textureOp = (op == EOpMethodSampleCmpLevelZero ? EOpTextureLodOffset : EOpTextureOffset);
+
+            // Create combined sampler & texture op
+            TIntermAggregate* txcombine = handleSamplerTextureCombine(loc, argTex, argSamp);
+            TIntermAggregate* txsample = new TIntermAggregate(textureOp);
+            txsample->getSequence().push_back(txcombine);
+            txsample->getSequence().push_back(coordWithCmp);
+
+            if (coordDimWithCmpVal == 5) // cube array shadow is special: cmp val follows coord.
+                txsample->getSequence().push_back(argCmpVal);
+
+            // the LevelZero form uses 0 as an explicit LOD
+            if (op == EOpMethodSampleCmpLevelZero)
+                txsample->getSequence().push_back(intermediate.addConstantUnion(0.0, EbtFloat, loc, true));
+
+            // Add offset if present
+            if (argOffset != nullptr)
+                txsample->getSequence().push_back(argOffset);
+
+            txsample->setType(node->getType());
+            txsample->setLoc(loc);
+            node = txsample;
+
+            break;
+        }
+
+    case EOpMethodLoad:
+        {
+            TIntermTyped* argTex    = argAggregate->getSequence()[0]->getAsTyped();
+            TIntermTyped* argCoord  = argAggregate->getSequence()[1]->getAsTyped();
+            TIntermTyped* argOffset = nullptr;
+            TIntermTyped* lodComponent = nullptr;
+            TIntermTyped* coordSwizzle = nullptr;
+
+            const bool isMS = argTex->getType().getSampler().isMultiSample();
+            const bool isBuffer = argTex->getType().getSampler().dim == EsdBuffer;
+            const TBasicType coordBaseType = argCoord->getType().getBasicType();
+
+            // Last component of coordinate is the mip level, for non-MS.  we separate them here:
+            if (isMS || isBuffer) {
+                // MS and Buffer have no LOD
+                coordSwizzle = argCoord;
+            } else {
+                // Extract coordinate
+                TVectorFields coordFields(0,1,2,3);
+                coordFields.num = argCoord->getType().getVectorSize() - (isMS ? 0 : 1);
+                TIntermTyped* coordIdx = intermediate.addSwizzle(coordFields, loc);
+                coordSwizzle = intermediate.addIndex(EOpVectorSwizzle, argCoord, coordIdx, loc);
+                coordSwizzle->setType(TType(coordBaseType, EvqTemporary, coordFields.num));
+
+                // Extract LOD
+                TIntermTyped* lodIdx = intermediate.addConstantUnion(coordFields.num, loc, true);
+                lodComponent = intermediate.addIndex(EOpIndexDirect, argCoord, lodIdx, loc);
+                lodComponent->setType(TType(coordBaseType, EvqTemporary, 1));
+            }
+
+            const int numArgs    = (int) argAggregate->getSequence().size();
+            const bool hasOffset = ((!isMS && numArgs == 3) || (isMS && numArgs == 4));
+
+            // Create texel fetch
+            const TOperator fetchOp = (hasOffset ? EOpTextureFetchOffset : EOpTextureFetch);
+            TIntermAggregate* txfetch = new TIntermAggregate(fetchOp);
+
+            // Build up the fetch
+            txfetch->getSequence().push_back(argTex);
+            txfetch->getSequence().push_back(coordSwizzle);
+
+            if (isMS) {
+                // add 2DMS sample index
+                TIntermTyped* argSampleIdx  = argAggregate->getSequence()[2]->getAsTyped();
+                txfetch->getSequence().push_back(argSampleIdx);
+            } else if (isBuffer) {
+                // Nothing else to do for buffers.
+            } else {
+                // 2DMS and buffer have no LOD, but everything else does.
+                txfetch->getSequence().push_back(lodComponent);
+            }
+
+            // Obtain offset arg, if there is one.
+            if (hasOffset) {
+                const int offsetPos  = (isMS ? 3 : 2);
+                argOffset = argAggregate->getSequence()[offsetPos]->getAsTyped();
+                txfetch->getSequence().push_back(argOffset);
+            }
+
+            txfetch->setType(node->getType());
+            txfetch->setLoc(loc);
+            node = txfetch;
+
+            break;
+        }
+
+    case EOpMethodSampleLevel:
+        {
+            TIntermTyped* argTex    = argAggregate->getSequence()[0]->getAsTyped();
+            TIntermTyped* argSamp   = argAggregate->getSequence()[1]->getAsTyped();
+            TIntermTyped* argCoord  = argAggregate->getSequence()[2]->getAsTyped();
+            TIntermTyped* argLod    = argAggregate->getSequence()[3]->getAsTyped();
+            TIntermTyped* argOffset = nullptr;
+
+            const int  numArgs = (int) argAggregate->getSequence().size();
+
+            if (numArgs == 5) // offset, if present
+                argOffset = argAggregate->getSequence()[4]->getAsTyped();
+            
+            const TOperator textureOp = (argOffset == nullptr ? EOpTextureLod : EOpTextureLodOffset);
+            TIntermAggregate* txsample = new TIntermAggregate(textureOp);
+
+            TIntermAggregate* txcombine = handleSamplerTextureCombine(loc, argTex, argSamp);
+
+            txsample->getSequence().push_back(txcombine);
+            txsample->getSequence().push_back(argCoord);
+            txsample->getSequence().push_back(argLod);
+
+            if (argOffset != nullptr)
+                txsample->getSequence().push_back(argOffset);
+
+            txsample->setType(node->getType());
+            txsample->setLoc(loc);
+            node = txsample;
+
+            break;
+        }
+
+    case EOpMethodGather:
+        {
+            TIntermTyped* argTex    = argAggregate->getSequence()[0]->getAsTyped();
+            TIntermTyped* argSamp   = argAggregate->getSequence()[1]->getAsTyped();
+            TIntermTyped* argCoord  = argAggregate->getSequence()[2]->getAsTyped();
+            TIntermTyped* argOffset = nullptr;
+
+            // Offset is optional
+            if (argAggregate->getSequence().size() > 3)
+                argOffset = argAggregate->getSequence()[3]->getAsTyped();
+
+            const TOperator textureOp = (argOffset == nullptr ? EOpTextureGather : EOpTextureGatherOffset);
+            TIntermAggregate* txgather = new TIntermAggregate(textureOp);
+
+            TIntermAggregate* txcombine = handleSamplerTextureCombine(loc, argTex, argSamp);
+
+            txgather->getSequence().push_back(txcombine);
+            txgather->getSequence().push_back(argCoord);
+            // Offset if not given is implicitly channel 0 (red)
+
+            if (argOffset != nullptr)
+                txgather->getSequence().push_back(argOffset);
+
+            txgather->setType(node->getType());
+            txgather->setLoc(loc);
+            node = txgather;
+
+            break;
+        }
+        
+    case EOpMethodGatherRed:      // fall through...
+    case EOpMethodGatherGreen:    // ...
+    case EOpMethodGatherBlue:     // ...
+    case EOpMethodGatherAlpha:    // ...
+    case EOpMethodGatherCmpRed:   // ...
+    case EOpMethodGatherCmpGreen: // ...
+    case EOpMethodGatherCmpBlue:  // ...
+    case EOpMethodGatherCmpAlpha: // ...
+        {
+            int channel = 0;    // the channel we are gathering
+            int cmpValues = 0;  // 1 if there is a compare value (handier than a bool below)
+
+            switch (op) {
+            case EOpMethodGatherCmpRed:   cmpValues = 1;  // fall through
+            case EOpMethodGatherRed:      channel = 0; break;
+            case EOpMethodGatherCmpGreen: cmpValues = 1;  // fall through
+            case EOpMethodGatherGreen:    channel = 1; break;
+            case EOpMethodGatherCmpBlue:  cmpValues = 1;  // fall through
+            case EOpMethodGatherBlue:     channel = 2; break;
+            case EOpMethodGatherCmpAlpha: cmpValues = 1;  // fall through
+            case EOpMethodGatherAlpha:    channel = 3; break;
+            default:                      assert(0);   break;
+            }
+
+            // For now, we have nothing to map the component-wise comparison forms
+            // to, because neither GLSL nor SPIR-V has such an opcode.  Issue an
+            // unimplemented error instead.  Most of the machinery is here if that
+            // should ever become available.
+            if (cmpValues) {
+                error(loc, "unimplemented: component-level gather compare", "", "");
+                return;
+            }
+
+            int arg = 0;
+
+            TIntermTyped* argTex        = argAggregate->getSequence()[arg++]->getAsTyped();
+            TIntermTyped* argSamp       = argAggregate->getSequence()[arg++]->getAsTyped();
+            TIntermTyped* argCoord      = argAggregate->getSequence()[arg++]->getAsTyped();
+            TIntermTyped* argOffset     = nullptr;
+            TIntermTyped* argOffsets[4] = { nullptr, nullptr, nullptr, nullptr };
+            // TIntermTyped* argStatus     = nullptr; // TODO: residency
+            TIntermTyped* argCmp        = nullptr;
+
+            const TSamplerDim dim = argTex->getType().getSampler().dim;
+
+            const int  argSize = argAggregate->getSequence().size();
+            bool hasStatus     = (argSize == (5+cmpValues) || argSize == (8+cmpValues));
+            bool hasOffset1    = false;
+            bool hasOffset4    = false;
+
+            // Only 2D forms can have offsets.  Discover if we have 0, 1 or 4 offsets.
+            if (dim == Esd2D) {
+                hasOffset1 = (argSize == (4+cmpValues) || argSize == (5+cmpValues));
+                hasOffset4 = (argSize == (7+cmpValues) || argSize == (8+cmpValues));
+            }
+
+            assert(!(hasOffset1 && hasOffset4));
+
+            TOperator textureOp = EOpTextureGather;
+
+            // Compare forms have compare value
+            if (cmpValues != 0)
+                argCmp = argOffset = argAggregate->getSequence()[arg++]->getAsTyped();
+
+            // Some forms have single offset
+            if (hasOffset1) {
+                textureOp = EOpTextureGatherOffset;   // single offset form
+                argOffset = argAggregate->getSequence()[arg++]->getAsTyped();
+            }
+
+            // Some forms have 4 gather offsets
+            if (hasOffset4) {
+                textureOp = EOpTextureGatherOffsets;  // note plural, for 4 offset form
+                for (int offsetNum = 0; offsetNum < 4; ++offsetNum)
+                    argOffsets[offsetNum] = argAggregate->getSequence()[arg++]->getAsTyped();
+            }
+
+            // Residency status
+            if (hasStatus) {
+                // argStatus = argAggregate->getSequence()[arg++]->getAsTyped();
+                error(loc, "unimplemented: residency status", "", "");
+                return;
+            }
+
+            TIntermAggregate* txgather = new TIntermAggregate(textureOp);
+            TIntermAggregate* txcombine = handleSamplerTextureCombine(loc, argTex, argSamp);
+
+            TIntermTyped* argChannel = intermediate.addConstantUnion(channel, loc, true);
+
+            txgather->getSequence().push_back(txcombine);
+            txgather->getSequence().push_back(argCoord);
+
+            // AST wants an array of 4 offsets, where HLSL has separate args.  Here
+            // we construct an array from the separate args.
+            if (hasOffset4) {
+                TType arrayType(EbtInt, EvqTemporary, 2);
+                TArraySizes arraySizes;
+                arraySizes.addInnerSize(4);
+                arrayType.newArraySizes(arraySizes);
+
+                TIntermAggregate* initList = new TIntermAggregate(EOpNull);
+
+                for (int offsetNum = 0; offsetNum < 4; ++offsetNum)
+                    initList->getSequence().push_back(argOffsets[offsetNum]);
+
+                argOffset = addConstructor(loc, initList, arrayType);
+            }
+
+            // Add comparison value if we have one
+            if (argTex->getType().getSampler().isShadow())
+                txgather->getSequence().push_back(argCmp);
+
+            // Add offset (either 1, or an array of 4) if we have one
+            if (argOffset != nullptr)
+                txgather->getSequence().push_back(argOffset);
+
+            txgather->getSequence().push_back(argChannel);
+
+            txgather->setType(node->getType());
+            txgather->setLoc(loc);
+            node = txgather;
+
+            break;
+        }
+
+    case EOpMethodCalculateLevelOfDetail:
+    case EOpMethodCalculateLevelOfDetailUnclamped:
+        {
+            TIntermTyped* argTex    = argAggregate->getSequence()[0]->getAsTyped();
+            TIntermTyped* argSamp   = argAggregate->getSequence()[1]->getAsTyped();
+            TIntermTyped* argCoord  = argAggregate->getSequence()[2]->getAsTyped();
+
+            TIntermAggregate* txquerylod = new TIntermAggregate(EOpTextureQueryLod);
+
+            TIntermAggregate* txcombine = handleSamplerTextureCombine(loc, argTex, argSamp);
+            txquerylod->getSequence().push_back(txcombine);
+            txquerylod->getSequence().push_back(argCoord);
+
+            TIntermTyped* lodComponent = intermediate.addConstantUnion(0, loc, true);
+            TIntermTyped* lodComponentIdx = intermediate.addIndex(EOpIndexDirect, txquerylod, lodComponent, loc);
+            lodComponentIdx->setType(TType(EbtFloat, EvqTemporary, 1));
+
+            node = lodComponentIdx;
+
+            // We cannot currently obtain the unclamped LOD
+            if (op == EOpMethodCalculateLevelOfDetailUnclamped)
+                error(loc, "unimplemented: CalculateLevelOfDetailUnclamped", "", "");
+
+            break;
+        }
+
+    case EOpMethodGetSamplePosition:
+        {
+            error(loc, "unimplemented: GetSamplePosition", "", "");
             break;
         }
 
@@ -1443,7 +1819,7 @@ TIntermTyped* HlslParseContext::handleFunctionCall(const TSourceLoc& loc, TFunct
             //
             // It's a constructor, of type 'type'.
             //
-            result = addConstructor(loc, arguments, type, op);
+            result = addConstructor(loc, arguments, type);
             if (result == nullptr)
                 error(loc, "cannot construct with these arguments", type.getCompleteString().c_str(), "");
         }
@@ -1712,11 +2088,6 @@ void HlslParseContext::builtInOpCheck(const TSourceLoc& loc, const TFunction& fn
     }
     const TIntermSequence& aggArgs = *argp;  // only valid when unaryArg is nullptr
 
-    // built-in texturing functions get their return value precision from the precision of the sampler
-    if (fnCandidate.getType().getQualifier().precision == EpqNone &&
-        fnCandidate.getParamCount() > 0 && fnCandidate[0].type->getBasicType() == EbtSampler)
-        callNode.getQualifier().precision = arg0->getQualifier().precision;
-
     switch (callNode.getOp()) {
     case EOpTextureGather:
     case EOpTextureGatherOffset:
@@ -1819,11 +2190,6 @@ void HlslParseContext::builtInOpCheck(const TSourceLoc& loc, const TFunction& fn
     case EOpInterpolateAtCentroid:
     case EOpInterpolateAtSample:
     case EOpInterpolateAtOffset:
-        // "For the interpolateAt* functions, the call will return a precision
-        // qualification matching the precision of the 'interpolant' argument to
-        // the function call."
-        callNode.getQualifier().precision = arg0->getQualifier().precision;
-
         // Make sure the first argument is an interpolant, or an array element of an interpolant
         if (arg0->getType().getQualifier().storage != EvqVaryingIn) {
             // It might still be an array element.
@@ -1849,7 +2215,7 @@ void HlslParseContext::builtInOpCheck(const TSourceLoc& loc, const TFunction& fn
 //
 TFunction* HlslParseContext::handleConstructorCall(const TSourceLoc& loc, const TType& type)
 {
-    TOperator op = mapTypeToConstructorOp(type);
+    TOperator op = intermediate.mapTypeToConstructorOp(type);
 
     if (op == EOpNull) {
         error(loc, "cannot construct this type", type.getBasicString(), "");
@@ -1894,129 +2260,85 @@ void HlslParseContext::handleSemantic(TType& type, const TString& semantic)
 }
 
 //
-// Given a type, find what operation would fully construct it.
+// Handle seeing something like "PACKOFFSET LEFT_PAREN c[Subcomponent][.component] RIGHT_PAREN"
 //
-TOperator HlslParseContext::mapTypeToConstructorOp(const TType& type) const
+// 'location' has the "c[Subcomponent]" part.
+// 'component' points to the "component" part, or nullptr if not present.
+//
+void HlslParseContext::handlePackOffset(const TSourceLoc& loc, TType& type, const glslang::TString& location,
+                                                                            const glslang::TString* component)
 {
-    TOperator op = EOpNull;
-
-    switch (type.getBasicType()) {
-    case EbtStruct:
-        op = EOpConstructStruct;
-        break;
-    case EbtSampler:
-        if (type.getSampler().combined)
-            op = EOpConstructTextureSampler;
-        break;
-    case EbtFloat:
-        if (type.isMatrix()) {
-            switch (type.getMatrixCols()) {
-            case 2:
-                switch (type.getMatrixRows()) {
-                case 2: op = EOpConstructMat2x2; break;
-                case 3: op = EOpConstructMat2x3; break;
-                case 4: op = EOpConstructMat2x4; break;
-                default: break; // some compilers want this
-                }
-                break;
-            case 3:
-                switch (type.getMatrixRows()) {
-                case 2: op = EOpConstructMat3x2; break;
-                case 3: op = EOpConstructMat3x3; break;
-                case 4: op = EOpConstructMat3x4; break;
-                default: break; // some compilers want this
-                }
-                break;
-            case 4:
-                switch (type.getMatrixRows()) {
-                case 2: op = EOpConstructMat4x2; break;
-                case 3: op = EOpConstructMat4x3; break;
-                case 4: op = EOpConstructMat4x4; break;
-                default: break; // some compilers want this
-                }
-                break;
-            default: break; // some compilers want this
-            }
-        } else {
-            switch (type.getVectorSize()) {
-            case 1: op = EOpConstructFloat; break;
-            case 2: op = EOpConstructVec2;  break;
-            case 3: op = EOpConstructVec3;  break;
-            case 4: op = EOpConstructVec4;  break;
-            default: break; // some compilers want this
-            }
-        }
-        break;
-    case EbtDouble:
-        if (type.getMatrixCols()) {
-            switch (type.getMatrixCols()) {
-            case 2:
-                switch (type.getMatrixRows()) {
-                case 2: op = EOpConstructDMat2x2; break;
-                case 3: op = EOpConstructDMat2x3; break;
-                case 4: op = EOpConstructDMat2x4; break;
-                default: break; // some compilers want this
-                }
-                break;
-            case 3:
-                switch (type.getMatrixRows()) {
-                case 2: op = EOpConstructDMat3x2; break;
-                case 3: op = EOpConstructDMat3x3; break;
-                case 4: op = EOpConstructDMat3x4; break;
-                default: break; // some compilers want this
-                }
-                break;
-            case 4:
-                switch (type.getMatrixRows()) {
-                case 2: op = EOpConstructDMat4x2; break;
-                case 3: op = EOpConstructDMat4x3; break;
-                case 4: op = EOpConstructDMat4x4; break;
-                default: break; // some compilers want this
-                }
-                break;
-            }
-        } else {
-            switch (type.getVectorSize()) {
-            case 1: op = EOpConstructDouble; break;
-            case 2: op = EOpConstructDVec2;  break;
-            case 3: op = EOpConstructDVec3;  break;
-            case 4: op = EOpConstructDVec4;  break;
-            default: break; // some compilers want this
-            }
-        }
-        break;
-    case EbtInt:
-        switch (type.getVectorSize()) {
-        case 1: op = EOpConstructInt;   break;
-        case 2: op = EOpConstructIVec2; break;
-        case 3: op = EOpConstructIVec3; break;
-        case 4: op = EOpConstructIVec4; break;
-        default: break; // some compilers want this
-        }
-        break;
-    case EbtUint:
-        switch (type.getVectorSize()) {
-        case 1: op = EOpConstructUint;  break;
-        case 2: op = EOpConstructUVec2; break;
-        case 3: op = EOpConstructUVec3; break;
-        case 4: op = EOpConstructUVec4; break;
-        default: break; // some compilers want this
-        }
-        break;
-    case EbtBool:
-        switch (type.getVectorSize()) {
-        case 1:  op = EOpConstructBool;  break;
-        case 2:  op = EOpConstructBVec2; break;
-        case 3:  op = EOpConstructBVec3; break;
-        case 4:  op = EOpConstructBVec4; break;
-        default: break; // some compilers want this
-        }
-        break;
-    default:
-        break;
+    if (location.size() == 0 || location[0] != 'c') {
+        error(loc, "expected 'c'", "packoffset", "");
+        return;
+    }
+    if (location.size() == 1)
+        return;
+    if (! isdigit(location[1])) {
+        error(loc, "expected number after 'c'", "packoffset", "");
+        return;
     }
 
-    return op;
+    type.getQualifier().layoutOffset = 16 * atoi(location.substr(1, location.size()).c_str());
+    if (component != nullptr) {
+        int componentOffset = 0;
+        switch ((*component)[0]) {
+        case 'x': componentOffset =  0; break;
+        case 'y': componentOffset =  4; break;
+        case 'z': componentOffset =  8; break;
+        case 'w': componentOffset = 12; break;
+        default:
+            componentOffset = -1;
+            break;
+        }
+        if (componentOffset < 0 || component->size() > 1) {
+            error(loc, "expected {x, y, z, w} for component", "packoffset", "");
+            return;
+        }
+        type.getQualifier().layoutOffset += componentOffset;
+    }
+}
+
+//
+// Handle seeing something like "REGISTER LEFT_PAREN [shader_profile,] Type# RIGHT_PAREN"
+//
+// 'profile' points to the shader_profile part, or nullptr if not present.
+// 'desc' is the type# part.
+//
+void HlslParseContext::handleRegister(const TSourceLoc& loc, TType& type, const glslang::TString* profile,
+                                                                          const glslang::TString& desc,
+                                                                          int subComponent)
+{
+    if (profile != nullptr)
+        warn(loc, "ignoring shader_profile", "register", "");
+
+    if (desc.size() < 1) {
+        error(loc, "expected register type", "register", "");
+        return;
+    }
+
+    int regNumber = 0;
+    if (desc.size() > 1) {
+        if (isdigit(desc[1]))
+            regNumber = atoi(desc.substr(1, desc.size()).c_str());
+        else {
+            error(loc, "expected register number after register type", "register", "");
+            return;
+        }
+    }
+
+    // TODO: learn what all these really mean and how they interact with regNumber and subComponent
+    switch (desc[0]) {
+    case 'b':
+    case 't':
+    case 'c':
+    case 's':
+        type.getQualifier().layoutBinding = regNumber + subComponent;
+        break;
+    default:
+        warn(loc, "ignoring unrecognized register type", "register", "%c", desc[0]);
+        break;
+    }
 }
 
 //
@@ -2375,17 +2697,13 @@ void HlslParseContext::mergeQualifiers(const TSourceLoc& loc, TQualifier& dst, c
     if (dst.storage == EvqTemporary || dst.storage == EvqGlobal)
         dst.storage = src.storage;
     else if ((dst.storage == EvqIn  && src.storage == EvqOut) ||
-        (dst.storage == EvqOut && src.storage == EvqIn))
+             (dst.storage == EvqOut && src.storage == EvqIn))
         dst.storage = EvqInOut;
     else if ((dst.storage == EvqIn    && src.storage == EvqConst) ||
-        (dst.storage == EvqConst && src.storage == EvqIn))
+             (dst.storage == EvqConst && src.storage == EvqIn))
         dst.storage = EvqConstReadOnly;
     else if (src.storage != EvqTemporary && src.storage != EvqGlobal)
         error(loc, "too many storage qualifiers", GetStorageQualifierString(src.storage), "");
-
-    // Precision qualifiers
-    if (dst.precision == EpqNone || (force && src.precision != EpqNone))
-        dst.precision = src.precision;
 
     // Layout qualifiers
     mergeObjectLayoutQualifiers(dst, src, false);
@@ -3503,7 +3821,7 @@ TIntermTyped* HlslParseContext::convertInitializerList(const TSourceLoc& loc, co
                 return nullptr;
         }
 
-        return addConstructor(loc, initList, arrayType, mapTypeToConstructorOp(arrayType));
+        return addConstructor(loc, initList, arrayType);
     } else if (type.isStruct()) {
         if (type.getStruct()->size() != initList->getSequence().size()) {
             error(loc, "wrong number of structure members", "initializer list", "");
@@ -3530,13 +3848,24 @@ TIntermTyped* HlslParseContext::convertInitializerList(const TSourceLoc& loc, co
             error(loc, "wrong vector size (or rows in a matrix column):", "initializer list", type.getCompleteString().c_str());
             return nullptr;
         }
-    } else {
+    } else if (type.isScalar()) {
+        if ((int)initList->getSequence().size() != 1) {
+            error(loc, "scalar expected one element:", "initializer list", type.getCompleteString().c_str());
+            return nullptr;
+        }
+   } else {
         error(loc, "unexpected initializer-list type:", "initializer list", type.getCompleteString().c_str());
         return nullptr;
     }
 
-    // now that the subtree is processed, process this node
-    return addConstructor(loc, initList, type, mapTypeToConstructorOp(type));
+    // Now that the subtree is processed, process this node as if the
+    // initializer list is a set of arguments to a constructor.
+    TIntermNode* emulatedConstructorArguments;
+    if (initList->getSequence().size() == 1)
+        emulatedConstructorArguments = initList->getSequence()[0];
+    else
+        emulatedConstructorArguments = initList;
+    return addConstructor(loc, emulatedConstructorArguments, type);
 }
 
 //
@@ -3545,12 +3874,13 @@ TIntermTyped* HlslParseContext::convertInitializerList(const TSourceLoc& loc, co
 //
 // Returns nullptr for an error or the constructed node (aggregate or typed) for no error.
 //
-TIntermTyped* HlslParseContext::addConstructor(const TSourceLoc& loc, TIntermNode* node, const TType& type, TOperator op)
+TIntermTyped* HlslParseContext::addConstructor(const TSourceLoc& loc, TIntermNode* node, const TType& type)
 {
     if (node == nullptr || node->getAsTyped() == nullptr)
         return nullptr;
 
     TIntermAggregate* aggrNode = node->getAsAggregate();
+    TOperator op = intermediate.mapTypeToConstructorOp(type);
 
     // Combined texture-sampler constructors are completely semantic checked
     // in constructorTextureSamplerError()
@@ -3740,28 +4070,31 @@ TIntermTyped* HlslParseContext::constructAggregate(TIntermNode* node, const TTyp
 //
 // Do everything needed to add an interface block.
 //
-void HlslParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, const TString* instanceName, TArraySizes* arraySizes)
+void HlslParseContext::declareBlock(const TSourceLoc& loc, TType& type, const TString* instanceName, TArraySizes* arraySizes)
 {
+    assert(type.getWritableStruct() != nullptr);
+
+    TTypeList& typeList = *type.getWritableStruct();
     // fix and check for member storage qualifiers and types that don't belong within a block
     for (unsigned int member = 0; member < typeList.size(); ++member) {
         TType& memberType = *typeList[member].type;
         TQualifier& memberQualifier = memberType.getQualifier();
         const TSourceLoc& memberLoc = typeList[member].loc;
         globalQualifierFix(memberLoc, memberQualifier);
-        memberQualifier.storage = currentBlockQualifier.storage;
+        memberQualifier.storage = type.getQualifier().storage;
     }
 
     // This might be a redeclaration of a built-in block.  If so, redeclareBuiltinBlock() will
     // do all the rest.
-    if (! symbolTable.atBuiltInLevel() && builtInName(*blockName)) {
-        redeclareBuiltinBlock(loc, typeList, *blockName, instanceName, arraySizes);
-        return;
-    }
+    //if (! symbolTable.atBuiltInLevel() && builtInName(*blockName)) {
+    //    redeclareBuiltinBlock(loc, typeList, *blockName, instanceName, arraySizes);
+    //    return;
+    //}
 
     // Make default block qualification, and adjust the member qualifications
 
     TQualifier defaultQualification;
-    switch (currentBlockQualifier.storage) {
+    switch (type.getQualifier().storage) {
     case EvqUniform:    defaultQualification = globalUniformDefaults;    break;
     case EvqBuffer:     defaultQualification = globalBufferDefaults;     break;
     case EvqVaryingIn:  defaultQualification = globalInputDefaults;      break;
@@ -3771,12 +4104,12 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, 
 
     // Special case for "push_constant uniform", which has a default of std430,
     // contrary to normal uniform defaults, and can't have a default tracked for it.
-    if (currentBlockQualifier.layoutPushConstant && ! currentBlockQualifier.hasPacking())
-        currentBlockQualifier.layoutPacking = ElpStd430;
+    if (type.getQualifier().layoutPushConstant && ! type.getQualifier().hasPacking())
+        type.getQualifier().layoutPacking = ElpStd430;
 
     // fix and check for member layout qualifiers
 
-    mergeObjectLayoutQualifiers(defaultQualification, currentBlockQualifier, true);
+    mergeObjectLayoutQualifiers(defaultQualification, type.getQualifier(), true);
 
     bool memberWithLocation = false;
     bool memberWithoutLocation = false;
@@ -3800,7 +4133,7 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, 
         if (memberQualifier.hasPacking())
             error(memberLoc, "member of block cannot have a packing layout qualifier", typeList[member].type->getFieldName().c_str(), "");
         if (memberQualifier.hasLocation()) {
-            switch (currentBlockQualifier.storage) {
+            switch (type.getQualifier().storage) {
             case EvqVaryingIn:
             case EvqVaryingOut:
                 memberWithLocation = true;
@@ -3821,19 +4154,20 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, 
     }
 
     // Process the members
-    fixBlockLocations(loc, currentBlockQualifier, typeList, memberWithLocation, memberWithoutLocation);
-    fixBlockXfbOffsets(currentBlockQualifier, typeList);
-    fixBlockUniformOffsets(currentBlockQualifier, typeList);
+    fixBlockLocations(loc, type.getQualifier(), typeList, memberWithLocation, memberWithoutLocation);
+    fixBlockXfbOffsets(type.getQualifier(), typeList);
+    fixBlockUniformOffsets(type.getQualifier(), typeList);
 
     // reverse merge, so that currentBlockQualifier now has all layout information
     // (can't use defaultQualification directly, it's missing other non-layout-default-class qualifiers)
-    mergeObjectLayoutQualifiers(currentBlockQualifier, defaultQualification, true);
+    mergeObjectLayoutQualifiers(type.getQualifier(), defaultQualification, true);
 
     //
     // Build and add the interface block as a new type named 'blockName'
     //
 
-    TType blockType(&typeList, *blockName, currentBlockQualifier);
+    //?? need the block name to be a typename?
+    TType blockType(&typeList, "" /* *blockName */, type.getQualifier());
     if (arraySizes)
         blockType.newArraySizes(*arraySizes);
 
@@ -3850,20 +4184,20 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, 
     // whose type is EbtBlock, but without all the structure; that will come from the type
     // the instances point to.
     //
-    TType blockNameType(EbtBlock, blockType.getQualifier().storage);
-    TVariable* blockNameVar = new TVariable(blockName, blockNameType);
-    if (! symbolTable.insert(*blockNameVar)) {
-        TSymbol* existingName = symbolTable.find(*blockName);
-        if (existingName->getType().getBasicType() == EbtBlock) {
-            if (existingName->getType().getQualifier().storage == blockType.getQualifier().storage) {
-                error(loc, "Cannot reuse block name within the same interface:", blockName->c_str(), blockType.getStorageQualifierString());
-                return;
-            }
-        } else {
-            error(loc, "block name cannot redefine a non-block name", blockName->c_str(), "");
-            return;
-        }
-    }
+    //??TType blockNameType(EbtBlock, blockType.getQualifier().storage);
+    //??TVariable* blockNameVar = new TVariable(blockName, blockNameType);
+    //if (! symbolTable.insert(*blockNameVar)) {
+    //    TSymbol* existingName = symbolTable.find(*blockName);
+    //    if (existingName->getType().getBasicType() == EbtBlock) {
+    //        if (existingName->getType().getQualifier().storage == blockType.getQualifier().storage) {
+    //            error(loc, "Cannot reuse block name within the same interface:", blockName->c_str(), blockType.getStorageQualifierString());
+    //            return;
+    //        }
+    //    } else {
+    //        error(loc, "block name cannot redefine a non-block name", blockName->c_str(), "");
+    //        return;
+    //    }
+    //}
 
     // Add the variable, as anonymous or named instanceName.
     // Make an anonymous variable if no name was provided.
@@ -3873,7 +4207,7 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, 
     TVariable& variable = *new TVariable(instanceName, blockType);
     if (! symbolTable.insert(variable)) {
         if (*instanceName == "")
-            error(loc, "nameless block contains a member that already has a name at global scope", blockName->c_str(), "");
+            error(loc, "nameless block contains a member that already has a name at global scope", "" /* blockName->c_str() */, "");
         else
             error(loc, "block instance name redefinition", variable.getName().c_str(), "");
 
