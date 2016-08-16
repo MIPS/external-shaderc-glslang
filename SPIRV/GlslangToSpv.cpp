@@ -212,7 +212,8 @@ spv::SourceLanguage TranslateSourceLanguage(glslang::EShSource source, EProfile 
             return spv::SourceLanguageUnknown;
         }
     case glslang::EShSourceHlsl:
-        return spv::SourceLanguageHLSL;
+        //Use SourceLanguageUnknown instead of SourceLanguageHLSL for now, until Vulkan knows what HLSL is
+        return spv::SourceLanguageUnknown;
     default:
         return spv::SourceLanguageUnknown;
     }
@@ -3082,11 +3083,9 @@ spv::Id TGlslangToSpvTraverser::createBinaryOperation(glslang::TOperator op, spv
 
     // Handle comparison instructions
 
-    if (reduceComparison && (builder.isVector(left) || builder.isMatrix(left) || builder.isAggregate(left))) {
-        assert(op == glslang::EOpEqual || op == glslang::EOpNotEqual);
-
+    if (reduceComparison && (op == glslang::EOpEqual || op == glslang::EOpNotEqual)
+                         && (builder.isVector(left) || builder.isMatrix(left) || builder.isAggregate(left)))
         return builder.createCompositeCompare(precision, left, right, op == glslang::EOpEqual);
-    }
 
     switch (op) {
     case glslang::EOpLessThan:
