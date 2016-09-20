@@ -67,11 +67,13 @@ namespace glslang {
         bool acceptSamplerDeclarationDX9(TType&);
         bool acceptSamplerState();
         bool acceptFullySpecifiedType(TType&);
-        void acceptQualifier(TQualifier&);
+        bool acceptQualifier(TQualifier&);
+        bool acceptLayoutQualifierList(TQualifier&);
         bool acceptType(TType&);
         bool acceptTemplateType(TBasicType&);
         bool acceptVectorTemplateType(TType&);
         bool acceptMatrixTemplateType(TType&);
+        bool acceptStringTemplateType(TType&);
         bool acceptSamplerType(TType&);
         bool acceptTextureType(TType&);
         bool acceptStruct(TType&);
@@ -104,7 +106,7 @@ namespace glslang {
         bool acceptCaseLabel(TIntermNode*&);
         bool acceptDefaultLabel(TIntermNode*&);
         void acceptArraySpecifier(TArraySizes*&);
-        void acceptPostDecls(TType&);
+        void acceptPostDecls(TQualifier&);
 
         HlslParseContext& parseContext;  // state of parsing and helper functions for building the intermediate
         TIntermediate& intermediate;     // the final product, the intermediate representation, includes the AST

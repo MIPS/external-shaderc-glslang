@@ -695,10 +695,9 @@ bool ProcessDeferred(
     TParseContextBase* parseContext;
     if (source == EShSourceHlsl) {
         parseContext = new HlslParseContext(symbolTable, intermediate, false, version, profile, spvVersion,
-                                             compiler->getLanguage(), compiler->infoSink, forwardCompatible, messages);
-    }
-    else {
-        intermediate.setEntryPoint("main");
+                                            compiler->getLanguage(), compiler->infoSink, forwardCompatible, messages);
+    } else {
+        intermediate.setEntryPointName("main");
         parseContext = new TParseContext(symbolTable, intermediate, false, version, profile, spvVersion,
                                          compiler->getLanguage(), compiler->infoSink, forwardCompatible, messages);
     }
@@ -1486,7 +1485,7 @@ void TShader::setStringsWithLengthsAndNames(
 
 void TShader::setEntryPoint(const char* entryPoint)
 {
-    intermediate->setEntryPoint(entryPoint);
+    intermediate->setEntryPointName(entryPoint);
 }
 
 //

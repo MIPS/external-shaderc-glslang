@@ -302,10 +302,10 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
     HlslToken idToken;
     while (acceptIdentifier(idToken)) {
         // function_parameters
-        TFunction* function = new TFunction(idToken.string, type);
-        if (acceptFunctionParameters(*function)) {
+        TFunction& function = *new TFunction(idToken.string, type);
+        if (acceptFunctionParameters(function)) {
             // post_decls
-            acceptPostDecls(type);
+            acceptPostDecls(function.getWritableType().getQualifier());
 
             // compound_statement (function body definition) or just a prototype?
             if (peekTokenClass(EHTokLeftBrace)) {
@@ -313,11 +313,11 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
                     parseContext.error(idToken.loc, "function body can't be in a declarator list", "{", "");
                 if (typedefDecl)
                     parseContext.error(idToken.loc, "function body can't be in a typedef", "{", "");
-                return acceptFunctionDefinition(*function, node);
+                return acceptFunctionDefinition(function, node);
             } else {
                 if (typedefDecl)
                     parseContext.error(idToken.loc, "function typedefs not implemented", "{", "");
-                parseContext.handleFunctionDeclarator(idToken.loc, *function, true);
+                parseContext.handleFunctionDeclarator(idToken.loc, function, true);
             }
         } else {
             // a variable declaration
@@ -333,7 +333,7 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
             }
 
             // post_decls
-            acceptPostDecls(type);
+            acceptPostDecls(type.getQualifier());
 
             // EQUAL assignment_expression
             TIntermTyped* expressionNode = nullptr;
@@ -426,7 +426,8 @@ bool HlslGrammar::acceptFullySpecifiedType(TType& type)
     // type_qualifier
     TQualifier qualifier;
     qualifier.clear();
-    acceptQualifier(qualifier);
+    if (! acceptQualifier(qualifier))
+        return false;
     TSourceLoc loc = token.loc;
 
     // type_specifier
@@ -434,7 +435,7 @@ bool HlslGrammar::acceptFullySpecifiedType(TType& type)
         return false;
     if (type.getBasicType() == EbtBlock) {
         // the type was a block, which set some parts of the qualifier
-        parseContext.mergeQualifiers(loc, type.getQualifier(), qualifier, true);
+        parseContext.mergeQualifiers(type.getQualifier(), qualifier);
         // further, it can create an anonymous instance of the block
         if (peekTokenClass(EHTokSemicolon))
             parseContext.declareBlock(loc, type);
@@ -449,7 +450,7 @@ bool HlslGrammar::acceptFullySpecifiedType(TType& type)
 //
 // Zero or more of these, so this can't return false.
 //
-void HlslGrammar::acceptQualifier(TQualifier& qualifier)
+bool HlslGrammar::acceptQualifier(TQualifier& qualifier)
 {
     do {
         switch (peek()) {
@@ -475,7 +476,6 @@ void HlslGrammar::acceptQualifier(TQualifier& qualifier)
             qualifier.volatil = true;
             break;
         case EHTokLinear:
-            qualifier.storage = EvqVaryingIn;
             qualifier.smooth = true;
             break;
         case EHTokCentroid:
@@ -508,11 +508,64 @@ void HlslGrammar::acceptQualifier(TQualifier& qualifier)
         case EHTokInOut:
             qualifier.storage = EvqInOut;
             break;
+        case EHTokLayout:
+            if (! acceptLayoutQualifierList(qualifier))
+                return false;
+            continue;
         default:
-            return;
+            return true;
         }
         advanceToken();
     } while (true);
+}
+
+// layout_qualifier_list
+//      : LAYOUT LEFT_PAREN layout_qualifier COMMA layout_qualifier ... RIGHT_PAREN
+//
+// layout_qualifier
+//      : identifier
+//      | identifier EQUAL expression
+//
+// Zero or more of these, so this can't return false.
+//
+bool HlslGrammar::acceptLayoutQualifierList(TQualifier& qualifier)
+{
+    if (! acceptTokenClass(EHTokLayout))
+        return false;
+
+    // LEFT_PAREN
+    if (! acceptTokenClass(EHTokLeftParen))
+        return false;
+
+    do {
+        // identifier
+        HlslToken idToken;
+        if (! acceptIdentifier(idToken))
+            break;
+
+        // EQUAL expression
+        if (acceptTokenClass(EHTokAssign)) {
+            TIntermTyped* expr;
+            if (! acceptConditionalExpression(expr)) {
+                expected("expression");
+                return false;
+            }
+            parseContext.setLayoutQualifier(idToken.loc, qualifier, *idToken.string, expr);
+        } else
+            parseContext.setLayoutQualifier(idToken.loc, qualifier, *idToken.string);
+
+        // COMMA
+        if (! acceptTokenClass(EHTokComma))
+            break;
+    } while (true);
+
+    // RIGHT_PAREN
+    if (! acceptTokenClass(EHTokRightParen)) {
+        expected(")");
+        return false;
+    }
+
+    return true;
 }
 
 // template_type
@@ -657,8 +710,8 @@ bool HlslGrammar::acceptMatrixTemplateType(TType& type)
         return false;
 
     new(&type) TType(basicType, EvqTemporary, 0,
-                     cols->getAsConstantUnion()->getConstArray()[0].getIConst(),
-                     rows->getAsConstantUnion()->getConstArray()[0].getIConst());
+                     rows->getAsConstantUnion()->getConstArray()[0].getIConst(),
+                     cols->getAsConstantUnion()->getConstArray()[0].getIConst());
 
     if (!acceptTokenClass(EHTokRightAngle)) {
         expected("right angle bracket");
@@ -668,6 +721,54 @@ bool HlslGrammar::acceptMatrixTemplateType(TType& type)
     return true;
 }
 
+// string_template_type
+//      : STRING
+//      | STRING identifier LEFT_ANGLE declaration SEMI_COLON ... declaration SEMICOLON RIGHT_ANGLE
+//
+bool HlslGrammar::acceptStringTemplateType(TType& type)
+{
+    // STRING
+    if (! acceptTokenClass(EHTokString))
+        return false;
+
+    // no matter what happens next, we recognized a string type
+    new(&type) TType(EbtString);
+
+    // identifier LEFT_ANGLE, or not?
+    if (! acceptTokenClass(EHTokIdentifier)) {
+        expected("identifier following 'string'");
+        return false;
+    }
+
+    if (! peekTokenClass(EHTokLeftAngle)) {
+        // then it must be the non-template version, back up and let
+        // normal declaration code handle it
+
+        // recede the identifier
+        recedeToken();
+        return true;
+    }
+
+    // move past the LEFT_ANGLE
+    advanceToken();
+
+    // declaration SEMI_COLON ... declaration SEMICOLON RIGHT_ANGLE
+    do {
+        // eat any extra SEMI_COLON; don't know if the grammar calls for this or not
+        while (acceptTokenClass(EHTokSemicolon))
+            ;
+
+        if (acceptTokenClass(EHTokRightAngle))
+            return true;
+
+        // declaration
+        TIntermNode* node;
+        if (! acceptDeclaration(node)) {
+            expected("declaration in string list");
+            return false;
+        }
+    } while (true);
+}
 
 // sampler_type
 //      : SAMPLER
@@ -841,6 +942,10 @@ bool HlslGrammar::acceptType(TType& type)
         return acceptMatrixTemplateType(type);
         break;
 
+    case EHTokString:
+        return acceptStringTemplateType(type);
+        break;
+
     case EHTokSampler:                // fall through
     case EHTokSampler1d:              // ...
     case EHTokSampler2d:              // ...
@@ -977,46 +1082,46 @@ bool HlslGrammar::acceptType(TType& type)
         new(&type) TType(EbtInt, EvqTemporary, 0, 1, 1);
         break;
     case EHTokInt1x2:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 2, 1);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 1, 2);
         break;
     case EHTokInt1x3:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 3, 1);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 1, 3);
         break;
     case EHTokInt1x4:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 4, 1);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 1, 4);
         break;
     case EHTokInt2x1:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 1, 2);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 2, 1);
         break;
     case EHTokInt2x2:
         new(&type) TType(EbtInt, EvqTemporary, 0, 2, 2);
         break;
     case EHTokInt2x3:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 3, 2);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 2, 3);
         break;
     case EHTokInt2x4:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 4, 2);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 2, 4);
         break;
     case EHTokInt3x1:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 1, 3);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 3, 1);
         break;
     case EHTokInt3x2:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 2, 3);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 3, 2);
         break;
     case EHTokInt3x3:
         new(&type) TType(EbtInt, EvqTemporary, 0, 3, 3);
         break;
     case EHTokInt3x4:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 4, 3);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 3, 4);
         break;
     case EHTokInt4x1:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 1, 4);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 4, 1);
         break;
     case EHTokInt4x2:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 2, 4);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 4, 2);
         break;
     case EHTokInt4x3:
-        new(&type) TType(EbtInt, EvqTemporary, 0, 3, 4);
+        new(&type) TType(EbtInt, EvqTemporary, 0, 4, 3);
         break;
     case EHTokInt4x4:
         new(&type) TType(EbtInt, EvqTemporary, 0, 4, 4);
@@ -1026,46 +1131,46 @@ bool HlslGrammar::acceptType(TType& type)
         new(&type) TType(EbtUint, EvqTemporary, 0, 1, 1);
         break;
     case EHTokUint1x2:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 2, 1);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 1, 2);
         break;
     case EHTokUint1x3:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 3, 1);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 1, 3);
         break;
     case EHTokUint1x4:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 4, 1);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 1, 4);
         break;
     case EHTokUint2x1:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 1, 2);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 2, 1);
         break;
     case EHTokUint2x2:
         new(&type) TType(EbtUint, EvqTemporary, 0, 2, 2);
         break;
     case EHTokUint2x3:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 3, 2);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 2, 3);
         break;
     case EHTokUint2x4:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 4, 2);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 2, 4);
         break;
     case EHTokUint3x1:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 1, 3);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 3, 1);
         break;
     case EHTokUint3x2:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 2, 3);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 3, 2);
         break;
     case EHTokUint3x3:
         new(&type) TType(EbtUint, EvqTemporary, 0, 3, 3);
         break;
     case EHTokUint3x4:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 4, 3);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 3, 4);
         break;
     case EHTokUint4x1:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 1, 4);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 4, 1);
         break;
     case EHTokUint4x2:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 2, 4);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 4, 2);
         break;
     case EHTokUint4x3:
-        new(&type) TType(EbtUint, EvqTemporary, 0, 3, 4);
+        new(&type) TType(EbtUint, EvqTemporary, 0, 4, 3);
         break;
     case EHTokUint4x4:
         new(&type) TType(EbtUint, EvqTemporary, 0, 4, 4);
@@ -1075,46 +1180,46 @@ bool HlslGrammar::acceptType(TType& type)
         new(&type) TType(EbtBool, EvqTemporary, 0, 1, 1);
         break;
     case EHTokBool1x2:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 2, 1);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 1, 2);
         break;
     case EHTokBool1x3:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 3, 1);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 1, 3);
         break;
     case EHTokBool1x4:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 4, 1);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 1, 4);
         break;
     case EHTokBool2x1:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 1, 2);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 2, 1);
         break;
     case EHTokBool2x2:
         new(&type) TType(EbtBool, EvqTemporary, 0, 2, 2);
         break;
     case EHTokBool2x3:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 3, 2);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 2, 3);
         break;
     case EHTokBool2x4:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 4, 2);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 2, 4);
         break;
     case EHTokBool3x1:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 1, 3);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 3, 1);
         break;
     case EHTokBool3x2:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 2, 3);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 3, 2);
         break;
     case EHTokBool3x3:
         new(&type) TType(EbtBool, EvqTemporary, 0, 3, 3);
         break;
     case EHTokBool3x4:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 4, 3);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 3, 4);
         break;
     case EHTokBool4x1:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 1, 4);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 4, 1);
         break;
     case EHTokBool4x2:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 2, 4);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 4, 2);
         break;
     case EHTokBool4x3:
-        new(&type) TType(EbtBool, EvqTemporary, 0, 3, 4);
+        new(&type) TType(EbtBool, EvqTemporary, 0, 4, 3);
         break;
     case EHTokBool4x4:
         new(&type) TType(EbtBool, EvqTemporary, 0, 4, 4);
@@ -1124,46 +1229,46 @@ bool HlslGrammar::acceptType(TType& type)
         new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 1);
         break;
     case EHTokFloat1x2:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 1);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 2);
         break;
     case EHTokFloat1x3:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 1);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 3);
         break;
     case EHTokFloat1x4:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 1);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 4);
         break;
     case EHTokFloat2x1:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 2);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 1);
         break;
     case EHTokFloat2x2:
         new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 2);
         break;
     case EHTokFloat2x3:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 2);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 3);
         break;
     case EHTokFloat2x4:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 2);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 4);
         break;
     case EHTokFloat3x1:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 3);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 1);
         break;
     case EHTokFloat3x2:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 3);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 2);
         break;
     case EHTokFloat3x3:
         new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 3);
         break;
     case EHTokFloat3x4:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 3);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 4);
         break;
     case EHTokFloat4x1:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 1, 4);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 1);
         break;
     case EHTokFloat4x2:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 2, 4);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 2);
         break;
     case EHTokFloat4x3:
-        new(&type) TType(EbtFloat, EvqTemporary, 0, 3, 4);
+        new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 3);
         break;
     case EHTokFloat4x4:
         new(&type) TType(EbtFloat, EvqTemporary, 0, 4, 4);
@@ -1173,46 +1278,46 @@ bool HlslGrammar::acceptType(TType& type)
         new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 1);
         break;
     case EHTokDouble1x2:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 1);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 2);
         break;
     case EHTokDouble1x3:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 1);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 3);
         break;
     case EHTokDouble1x4:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 1);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 4);
         break;
     case EHTokDouble2x1:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 2);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 1);
         break;
     case EHTokDouble2x2:
         new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 2);
         break;
     case EHTokDouble2x3:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 2);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 3);
         break;
     case EHTokDouble2x4:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 2);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 4);
         break;
     case EHTokDouble3x1:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 3);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 1);
         break;
     case EHTokDouble3x2:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 3);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 2);
         break;
     case EHTokDouble3x3:
         new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 3);
         break;
     case EHTokDouble3x4:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 3);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 4);
         break;
     case EHTokDouble4x1:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 1, 4);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 1);
         break;
     case EHTokDouble4x2:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 2, 4);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 2);
         break;
     case EHTokDouble4x3:
-        new(&type) TType(EbtDouble, EvqTemporary, 0, 3, 4);
+        new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 3);
         break;
     case EHTokDouble4x4:
         new(&type) TType(EbtDouble, EvqTemporary, 0, 4, 4);
@@ -1238,17 +1343,16 @@ bool HlslGrammar::acceptType(TType& type)
 //
 bool HlslGrammar::acceptStruct(TType& type)
 {
-    // This qualifier.storage will tell us whether it's an AST block or
-    // just a struct.
-    TQualifier qualifier;
-    qualifier.clear();
+    // This storage qualifier will tell us whether it's an AST
+    // block type or just a generic structure type.
+    TStorageQualifier storageQualifier = EvqTemporary;
 
     // CBUFFER
     if (acceptTokenClass(EHTokCBuffer))
-        qualifier.storage = EvqUniform;
+        storageQualifier = EvqUniform;
     // TBUFFER
     else if (acceptTokenClass(EHTokTBuffer))
-        qualifier.storage = EvqBuffer;
+        storageQualifier = EvqBuffer;
     // STRUCT
     else if (! acceptTokenClass(EHTokStruct))
         return false;
@@ -1261,7 +1365,9 @@ bool HlslGrammar::acceptStruct(TType& type)
     }
 
     // post_decls
-    acceptPostDecls(type);
+    TQualifier postDeclQualifier;
+    postDeclQualifier.clear();
+    acceptPostDecls(postDeclQualifier);
 
     // LEFT_BRACE
     if (! acceptTokenClass(EHTokLeftBrace)) {
@@ -1283,10 +1389,12 @@ bool HlslGrammar::acceptStruct(TType& type)
     }
 
     // create the user-defined type
-    if (qualifier.storage == EvqTemporary)
+    if (storageQualifier == EvqTemporary)
         new(&type) TType(typeList, structName);
-    else
-        new(&type) TType(typeList, structName, qualifier); // sets EbtBlock
+    else {
+        postDeclQualifier.storage = storageQualifier;
+        new(&type) TType(typeList, structName, postDeclQualifier); // sets EbtBlock
+    }
 
     // If it was named, which means the type can be reused later, add
     // it to the symbol table.  (Unless it's a block, in which
@@ -1351,7 +1459,7 @@ bool HlslGrammar::acceptStructDeclarationList(TTypeList*& typeList)
             if (arraySizes)
                 typeList->back().type->newArraySizes(*arraySizes);
 
-            acceptPostDecls(*member.type);
+            acceptPostDecls(member.type->getQualifier());
 
             // success on seeing the SEMICOLON coming up
             if (peekTokenClass(EHTokSemicolon))
@@ -1428,7 +1536,7 @@ bool HlslGrammar::acceptParameterDeclaration(TFunction& function)
         type->newArraySizes(*arraySizes);
 
     // post_decls
-    acceptPostDecls(*type);
+    acceptPostDecls(type->getQualifier());
 
     parseContext.paramFix(*type);
 
@@ -1442,19 +1550,16 @@ bool HlslGrammar::acceptParameterDeclaration(TFunction& function)
 // parsing the body (compound_statement).
 bool HlslGrammar::acceptFunctionDefinition(TFunction& function, TIntermNode*& node)
 {
-    TFunction* functionDeclarator = parseContext.handleFunctionDeclarator(token.loc, function, false /* not prototype */);
+    TFunction& functionDeclarator = parseContext.handleFunctionDeclarator(token.loc, function, false /* not prototype */);
+    TSourceLoc loc = token.loc;
 
     // This does a pushScope()
-    node = parseContext.handleFunctionDefinition(token.loc, *functionDeclarator);
+    node = parseContext.handleFunctionDefinition(loc, functionDeclarator);
 
     // compound_statement
     TIntermNode* functionBody = nullptr;
     if (acceptCompoundStatement(functionBody)) {
-        node = intermediate.growAggregate(node, functionBody);
-        intermediate.setAggregateOperator(node, EOpFunction, functionDeclarator->getType(), token.loc);
-        node->getAsAggregate()->setName(functionDeclarator->getMangledName().c_str());
-        parseContext.popScope();
-
+        parseContext.handleFunctionBody(loc, functionDeclarator, functionBody, node);
         return true;
     }
 
@@ -1618,7 +1723,7 @@ bool HlslGrammar::acceptAssignmentExpression(TIntermTyped*& node)
         return false;
     }
 
-    node = intermediate.addAssign(assignOp, node, rightNode, loc);
+    node = parseContext.handleAssign(loc, assignOp, node, rightNode);
     if (node == nullptr) {
         parseContext.error(loc, "could not create assignment", "", "");
         return false;
@@ -2008,6 +2113,9 @@ bool HlslGrammar::acceptLiteral(TIntermTyped*& node)
         break;
     case EHTokBoolConstant:
         node = intermediate.addConstantUnion(token.b, token.loc, true);
+        break;
+    case EHTokStringConstant:
+        node = nullptr;
         break;
 
     default:
@@ -2537,18 +2645,21 @@ void HlslGrammar::acceptArraySpecifier(TArraySizes*& arraySizes)
 }
 
 // post_decls
-//      : COLON semantic                                                            // optional
-//        COLON PACKOFFSET LEFT_PAREN c[Subcomponent][.component]       RIGHT_PAREN // optional
-//        COLON REGISTER LEFT_PAREN [shader_profile,] Type#[subcomp]opt RIGHT_PAREN // optional
-//        annotations                                                               // optional
+//      : COLON semantic // optional
+//        COLON PACKOFFSET LEFT_PAREN c[Subcomponent][.component] RIGHT_PAREN // optional
+//        COLON REGISTER LEFT_PAREN [shader_profile,] Type#[subcomp]opt (COMMA SPACEN)opt RIGHT_PAREN // optional
+//        COLON LAYOUT layout_qualifier_list
+//        annotations // optional
 //
-void HlslGrammar::acceptPostDecls(TType& type)
+void HlslGrammar::acceptPostDecls(TQualifier& qualifier)
 {
     do {
         // COLON 
         if (acceptTokenClass(EHTokColon)) {
             HlslToken idToken;
-            if (acceptTokenClass(EHTokPackOffset)) {
+            if (peekTokenClass(EHTokLayout))
+                acceptLayoutQualifierList(qualifier);
+            else if (acceptTokenClass(EHTokPackOffset)) {
                 // PACKOFFSET LEFT_PAREN c[Subcomponent][.component] RIGHT_PAREN
                 if (! acceptTokenClass(EHTokLeftParen)) {
                     expected("(");
@@ -2570,12 +2681,13 @@ void HlslGrammar::acceptPostDecls(TType& type)
                     expected(")");
                     break;
                 }
-                parseContext.handlePackOffset(locationToken.loc, type, *locationToken.string, componentToken.string);
+                parseContext.handlePackOffset(locationToken.loc, qualifier, *locationToken.string, componentToken.string);
             } else if (! acceptIdentifier(idToken)) {
-                expected("semantic or packoffset or register");
+                expected("layout, semantic, packoffset, or register");
                 return;
             } else if (*idToken.string == "register") {
-                // REGISTER LEFT_PAREN [shader_profile,] Type#[subcomp]opt RIGHT_PAREN
+                // REGISTER LEFT_PAREN [shader_profile,] Type#[subcomp]opt (COMMA SPACEN)opt RIGHT_PAREN
+                // LEFT_PAREN
                 if (! acceptTokenClass(EHTokLeftParen)) {
                     expected("(");
                     return;
@@ -2586,7 +2698,8 @@ void HlslGrammar::acceptPostDecls(TType& type)
                     expected("register number description");
                     return;
                 }
-                if (acceptTokenClass(EHTokComma)) {
+                if (registerDesc.string->size() > 1 && !isdigit((*registerDesc.string)[1]) &&
+                                                       acceptTokenClass(EHTokComma)) {
                     // Then we didn't really see the registerDesc yet, it was
                     // actually the profile.  Adjust...
                     profile = registerDesc;
@@ -2609,14 +2722,23 @@ void HlslGrammar::acceptPostDecls(TType& type)
                         break;
                     }
                 }
+                // (COMMA SPACEN)opt
+                HlslToken spaceDesc;
+                if (acceptTokenClass(EHTokComma)) {
+                    if (! acceptIdentifier(spaceDesc)) {
+                        expected ("space identifier");
+                        return;
+                    }
+                }
+                // RIGHT_PAREN
                 if (! acceptTokenClass(EHTokRightParen)) {
                     expected(")");
                     break;
                 }
-                parseContext.handleRegister(registerDesc.loc, type, profile.string, *registerDesc.string, subComponent);
+                parseContext.handleRegister(registerDesc.loc, qualifier, profile.string, *registerDesc.string, subComponent, spaceDesc.string);
             } else {
                 // semantic, in idToken.string
-                parseContext.handleSemantic(type, *idToken.string);
+                parseContext.handleSemantic(idToken.loc, qualifier, *idToken.string);
             }
         } else if (acceptTokenClass(EHTokLeftAngle)) {
             // TODO: process annotations, just accepting them for now
