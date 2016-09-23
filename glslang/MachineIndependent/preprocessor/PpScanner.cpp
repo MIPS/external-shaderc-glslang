@@ -81,10 +81,8 @@ NVIDIA HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define _CRT_SECURE_NO_WARNINGS
 
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 #include "PpContext.h"
 #include "PpTokens.h"
@@ -698,7 +696,7 @@ int TPpContext::tStringInput::scan(TPpToken* ppToken)
 }
 
 //
-// The main functional entry-point into the preprocessor, which will
+// The main functional entry point into the preprocessor, which will
 // scan the source strings to figure out and return the next processing token.
 //
 // Return string pointer to next token.
@@ -749,7 +747,12 @@ const char* TPpContext::tokenize(TPpToken* ppToken)
             tokenString = ppToken->name;
             break;
         case PpAtomConstString:
-            parseContext.ppError(ppToken->loc, "string literals not supported", "\"\"", "");
+            if (parseContext.intermediate.getSource() == EShSourceHlsl) {
+                // HLSL allows string literals.
+                tokenString = ppToken->name;
+            } else {
+                parseContext.ppError(ppToken->loc, "string literals not supported", "\"\"", "");
+            }
             break;
         case '\'':
             parseContext.ppError(ppToken->loc, "character literals not supported", "\'", "");
@@ -759,12 +762,8 @@ const char* TPpContext::tokenize(TPpToken* ppToken)
             break;
         }
 
-        if (tokenString) {
-            if (tokenString[0] != 0)
-                parseContext.tokensBeforeEOF = 1;
-
+        if (tokenString)
             return tokenString;
-        }
     }
 }
 

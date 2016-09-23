@@ -46,9 +46,9 @@
 #include "../SPIRV/GLSL.std.450.h"
 #include "../SPIRV/doc.h"
 #include "../SPIRV/disassemble.h"
-#include <string.h>
-#include <stdlib.h>
-#include <math.h>
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
 
 #include "../glslang/OSDependent/osinclude.h"
 
@@ -155,6 +155,7 @@ int Options = 0;
 const char* ExecutableName = nullptr;
 const char* binaryFileName = nullptr;
 const char* entryPointName = nullptr;
+const char* shaderStageName = nullptr;
 
 //
 // Create the default name for saving a binary if -o is not provided.
@@ -235,6 +236,15 @@ void ProcessArguments(int argc, char* argv[])
                 Options |= EOptionSpv;
                 Options |= EOptionVulkanRules;
                 Options |= EOptionLinkProgram;
+                break;
+            case 'S':
+                shaderStageName = argv[1];
+                if (argc > 0) {
+                    argc--;
+                    argv++;
+                }
+                else
+                    Error("no <stage> specified for -S");
                 break;
             case 'G':
                 Options |= EOptionSpv;
@@ -402,7 +412,26 @@ void StderrIfNonEmpty(const char* str)
 struct ShaderCompUnit {
     EShLanguage stage;
     std::string fileName;
-    char** text;           // memory owned/managed externally
+    char** text;             // memory owned/managed externally
+    const char*  fileNameList[1];
+
+    // Need to have a special constructors to adjust the fileNameList, since back end needs a list of ptrs
+    ShaderCompUnit(EShLanguage istage, std::string &ifileName, char** itext)
+    {
+        stage = istage;
+        fileName = ifileName;
+        text    = itext;
+        fileNameList[0] = fileName.c_str();
+    }
+
+    ShaderCompUnit(const ShaderCompUnit &rhs)
+    {
+        stage = rhs.stage;
+        fileName = rhs.fileName;
+        text = rhs.text;
+        fileNameList[0] = fileName.c_str();
+    }
+
 };
 
 //
@@ -429,7 +458,7 @@ void CompileAndLinkShaderUnits(std::vector<ShaderCompUnit> compUnits)
     for (auto it = compUnits.cbegin(); it != compUnits.cend(); ++it) {
         const auto &compUnit = *it;
         glslang::TShader* shader = new glslang::TShader(compUnit.stage);
-        shader->setStrings(compUnit.text, 1);
+        shader->setStringsWithLengthsAndNames(compUnit.text, NULL, compUnit.fileNameList, 1);
         if (entryPointName) // HLSL todo: this needs to be tracked per compUnits
             shader->setEntryPoint(entryPointName);
         shaders.push_back(shader);
@@ -685,6 +714,9 @@ EShLanguage FindLanguage(const std::string& name)
     }
 
     std::string suffix = name.substr(ext + 1, std::string::npos);
+    if (shaderStageName)
+        suffix = shaderStageName;
+
     if (suffix == "vert")
         return EShLangVertex;
     else if (suffix == "tesc")
@@ -778,6 +810,8 @@ void usage()
            "  -H          print human readable form of SPIR-V; turns on -V\n"
            "  -E          print pre-processed GLSL; cannot be used with -l;\n"
            "              errors will appear on stderr.\n"
+           "  -S <stage>  uses explicit stage specified, rather then the file extension.\n"
+           "              valid choices are vert, tesc, tese, geom, frag, or comp\n"
            "  -c          configuration dump;\n"
            "              creates the default configuration file (redirect to a .conf file)\n"
            "  -C          cascading errors; risks crashes from accumulation of error recoveries\n"

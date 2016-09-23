@@ -64,11 +64,13 @@ enum EHlslTokenClass {
     EHTokIn,
     EHTokOut,
     EHTokInOut,
+    EHTokLayout,
 
     // template types
     EHTokBuffer,
     EHTokVector,
     EHTokMatrix,
+    EHTokString,
 
     // scalar types
     EHTokVoid,
@@ -222,6 +224,7 @@ enum EHlslTokenClass {
     EHTokIntConstant,
     EHTokUintConstant,
     EHTokBoolConstant,
+    EHTokStringConstant,
 
     // control flow
     EHTokFor,

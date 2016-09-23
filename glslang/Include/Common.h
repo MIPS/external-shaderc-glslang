@@ -89,8 +89,8 @@ inline long long int atoll (const char* str)
 #include <list>
 #include <algorithm>
 #include <string>
-#include <stdio.h>
-#include <assert.h>
+#include <cstdio>
+#include <cassert>
 
 #include "PoolAlloc.h"
 
@@ -99,11 +99,11 @@ inline long long int atoll (const char* str)
 //
 #define POOL_ALLOCATOR_NEW_DELETE(A)                                  \
     void* operator new(size_t s) { return (A).allocate(s); }          \
-    void* operator new(size_t, void *_Where) { return (_Where);	}     \
+    void* operator new(size_t, void *_Where) { return (_Where); }     \
     void operator delete(void*) { }                                   \
     void operator delete(void *, void *) { }                          \
     void* operator new[](size_t s) { return (A).allocate(s); }        \
-    void* operator new[](size_t, void *_Where) { return (_Where);	} \
+    void* operator new[](size_t, void *_Where) { return (_Where); }   \
     void operator delete[](void*) { }                                 \
     void operator delete[](void *, void *) { }
 

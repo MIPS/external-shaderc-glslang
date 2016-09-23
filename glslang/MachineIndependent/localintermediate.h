@@ -137,7 +137,7 @@ class TIntermediate {
 public:
     explicit TIntermediate(EShLanguage l, int v = 0, EProfile p = ENoProfile) :
         source(EShSourceNone), language(l), profile(p), version(v), treeRoot(0),
-        numMains(0), numErrors(0), numPushConstants(0), recursive(false),
+        numEntryPoints(0), numErrors(0), numPushConstants(0), recursive(false),
         invocations(TQualifier::layoutNotSet), vertices(TQualifier::layoutNotSet), inputPrimitive(ElgNone), outputPrimitive(ElgNone),
         pixelCenterInteger(false), originUpperLeft(false),
         vertexSpacing(EvsNone), vertexOrder(EvoNone), pointMode(false), earlyFragmentTests(false), depthLayout(EldNone), depthReplacing(false), blendEquations(0),
@@ -159,8 +159,10 @@ public:
 
     void setSource(EShSource s) { source = s; }
     EShSource getSource() const { return source; }
-    void setEntryPoint(const char* ep) { entryPoint = ep; }
-    const std::string& getEntryPoint() const { return entryPoint; }
+    void setEntryPointName(const char* ep) { entryPointName = ep; }
+    void setEntryPointMangledName(const char* ep) { entryPointMangledName = ep; }
+    const std::string& getEntryPointName() const { return entryPointName; }
+    const std::string& getEntryPointMangledName() const { return entryPointMangledName; }
     void setVersion(int v) { version = v; }
     int getVersion() const { return version; }
     void setProfile(EProfile p) { profile = p; }
@@ -173,8 +175,8 @@ public:
 
     void setTreeRoot(TIntermNode* r) { treeRoot = r; }
     TIntermNode* getTreeRoot() const { return treeRoot; }
-    void addMainCount() { ++numMains; }
-    int getNumMains() const { return numMains; }
+    void incrementEntryPointCount() { ++numEntryPoints; }
+    int getNumEntryPoints() const { return numEntryPoints; }
     int getNumErrors() const { return numErrors; }
     void addPushConstantCount() { ++numPushConstants; }
     bool isRecursive() const { return recursive; }
@@ -189,7 +191,7 @@ public:
     TIntermTyped* addIndex(TOperator op, TIntermTyped* base, TIntermTyped* index, TSourceLoc);
     TIntermTyped* addUnaryMath(TOperator, TIntermTyped* child, TSourceLoc);
     TIntermTyped* addBuiltInFunctionCall(const TSourceLoc& line, TOperator, bool unary, TIntermNode*, const TType& returnType);
-    bool canImplicitlyPromote(TBasicType from, TBasicType to) const;
+    bool canImplicitlyPromote(TBasicType from, TBasicType to, TOperator op = EOpNull) const;
     TOperator mapTypeToConstructorOp(const TType&) const;
     TIntermAggregate* growAggregate(TIntermNode* left, TIntermNode* right);
     TIntermAggregate* growAggregate(TIntermNode* left, TIntermNode* right, const TSourceLoc&);
@@ -331,6 +333,7 @@ public:
     bool inIoAccessed(const TString& name) const { return ioAccessed.find(name) != ioAccessed.end(); }
 
     int addUsedLocation(const TQualifier&, const TType&, bool& typeCollision);
+    int checkLocationRange(int set, const TIoRange& range, const TType&, bool& typeCollision);
     int addUsedOffsets(int binding, int offset, int numOffsets);
     bool addUsedConstantId(int id);
     int computeTypeLocationSize(const TType&) const;
@@ -362,14 +365,15 @@ protected:
 
     const EShLanguage language;  // stage, known at construction time
     EShSource source;            // source language, known a bit later
-    std::string entryPoint;
+    std::string entryPointName;
+    std::string entryPointMangledName;
     EProfile profile;
     int version;
     SpvVersion spvVersion;
     TIntermNode* treeRoot;
     std::set<std::string> requestedExtensions;  // cumulation of all enabled or required extensions; not connected to what subset of the shader used them
     TBuiltInResource resources;
-    int numMains;
+    int numEntryPoints;
     int numErrors;
     int numPushConstants;
     bool recursive;

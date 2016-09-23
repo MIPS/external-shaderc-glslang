@@ -44,7 +44,7 @@
 #include "SymbolTable.h"
 #include "propagateNoContraction.h"
 
-#include <float.h>
+#include <cfloat>
 
 namespace glslang {
 
@@ -117,6 +117,10 @@ TIntermTyped* TIntermediate::addBinaryMath(TOperator op, TIntermTyped* left, TIn
         else
             return 0;
     }
+
+    // Convert the children's type shape to be compatible.
+    right = addShapeConversion(op,  left->getType(), right);
+    left  = addShapeConversion(op, right->getType(),  left);
 
     //
     // Need a new node holding things together.  Make
@@ -270,7 +274,8 @@ TIntermTyped* TIntermediate::addUnaryMath(TOperator op, TIntermTyped* child, TSo
     if (newType != EbtVoid) {
         child = addConversion(op, TType(newType, EvqTemporary, child->getVectorSize(),
                                                                child->getMatrixCols(),
-                                                               child->getMatrixRows()),
+                                                               child->getMatrixRows(),
+                                                               child->isVector()),
                               child);
         if (child == 0)
             return 0;
@@ -520,7 +525,7 @@ TIntermTyped* TIntermediate::addConversion(TOperator op, const TType& type, TInt
         if (type.getBasicType() == node->getType().getBasicType())
             return node;
 
-        if (canImplicitlyPromote(node->getType().getBasicType(), type.getBasicType()))
+        if (canImplicitlyPromote(node->getType().getBasicType(), type.getBasicType(), op))
             promoteTo = type.getBasicType();
         else
             return 0;
@@ -694,6 +699,13 @@ TIntermTyped* TIntermediate::addShapeConversion(TOperator op, const TType& type,
     // some operations don't do this
     switch (op) {
     case EOpAssign:
+    case EOpLessThan:
+    case EOpGreaterThan:
+    case EOpLessThanEqual:
+    case EOpGreaterThanEqual:
+    case EOpEqual:
+    case EOpNotEqual:
+    case EOpFunctionCall:
         break;
     default:
         return node;
@@ -705,12 +717,13 @@ TIntermTyped* TIntermediate::addShapeConversion(TOperator op, const TType& type,
         return node;
 
     // The new node that handles the conversion
-    TIntermTyped* conversionNode = node;
     TOperator constructorOp = mapTypeToConstructorOp(type);
 
-    // scalar -> smeared -> vector
-    if (type.isVector() && node->getType().isScalar())
-        return setAggregateOperator(node, constructorOp, type, node->getLoc());
+    // scalar -> smeared -> vector, or
+    // bigger vector -> smaller vector or scalar
+    if ((type.isVector() && node->getType().isScalar()) ||
+        (node->getVectorSize() > type.getVectorSize() && type.isVector()))
+        return setAggregateOperator(makeAggregate(node), constructorOp, type, node->getLoc());
 
     return node;
 }
@@ -719,10 +732,38 @@ TIntermTyped* TIntermediate::addShapeConversion(TOperator op, const TType& type,
 // See if the 'from' type is allowed to be implicitly converted to the
 // 'to' type.  This is not about vector/array/struct, only about basic type.
 //
-bool TIntermediate::canImplicitlyPromote(TBasicType from, TBasicType to) const
+bool TIntermediate::canImplicitlyPromote(TBasicType from, TBasicType to, TOperator op) const
 {
     if (profile == EEsProfile || version == 110)
         return false;
+
+    // TODO: Move more policies into language-specific handlers.
+    // Some languages allow more general (or potentially, more specific) conversions under some conditions.
+    if (source == EShSourceHlsl) {
+        const bool fromConvertable = (from == EbtFloat || from == EbtDouble || from == EbtInt || from == EbtUint || from == EbtBool);
+        const bool toConvertable = (to == EbtFloat || to == EbtDouble || to == EbtInt || to == EbtUint || to == EbtBool);
+
+        if (fromConvertable && toConvertable) {
+            switch (op) {
+            case EOpAndAssign:               // assignments can perform arbitrary conversions
+            case EOpInclusiveOrAssign:       // ... 
+            case EOpExclusiveOrAssign:       // ... 
+            case EOpAssign:                  // ... 
+            case EOpAddAssign:               // ... 
+            case EOpSubAssign:               // ... 
+            case EOpMulAssign:               // ... 
+            case EOpVectorTimesScalarAssign: // ... 
+            case EOpMatrixTimesScalarAssign: // ... 
+            case EOpDivAssign:               // ... 
+            case EOpModAssign:               // ... 
+            case EOpReturn:                  // function returns can also perform arbitrary conversions
+            case EOpFunctionCall:            // conversion of a calling parameter
+                return true;
+            default:
+                break;
+            }
+        }
+    }
 
     switch (to) {
     case EbtDouble:
@@ -1403,6 +1444,8 @@ bool TIntermediate::isSpecializationOperation(const TIntermOperator& node) const
         case EOpIndexIndirect:
         case EOpIndexDirectStruct:
         case EOpVectorSwizzle:
+        case EOpConvFloatToDouble:
+        case EOpConvDoubleToFloat:
             return true;
         default:
             return false;
@@ -1433,6 +1476,20 @@ bool TIntermediate::isSpecializationOperation(const TIntermOperator& node) const
     case EOpConvBoolToInt:
     case EOpConvIntToUint:
     case EOpConvBoolToUint:
+    case EOpConvInt64ToBool:
+    case EOpConvBoolToInt64:
+    case EOpConvUint64ToBool:
+    case EOpConvBoolToUint64:
+    case EOpConvInt64ToInt:
+    case EOpConvIntToInt64:
+    case EOpConvUint64ToUint:
+    case EOpConvUintToUint64:
+    case EOpConvInt64ToUint64:
+    case EOpConvUint64ToInt64:
+    case EOpConvInt64ToUint:
+    case EOpConvUintToInt64:
+    case EOpConvUint64ToInt:
+    case EOpConvIntToUint64:
 
     // unary operations
     case EOpNegative:
@@ -1624,11 +1681,11 @@ bool TIntermBinary::promote()
     case EOpGreaterThan:
     case EOpLessThanEqual:
     case EOpGreaterThanEqual:
-        // Relational comparisons need matching numeric types and will promote to scalar Boolean.
-        if (left->getBasicType() == EbtBool || left->getType().isVector() || left->getType().isMatrix())
+        // Relational comparisons need numeric types and will promote to scalar Boolean.
+        if (left->getBasicType() == EbtBool)
             return false;
-
-        // Fall through
+        setType(TType(EbtBool));
+        break;
 
     case EOpEqual:
     case EOpNotEqual:

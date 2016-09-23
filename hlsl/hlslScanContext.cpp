@@ -38,7 +38,7 @@
 // HLSL scanning, leveraging the scanning done by the preprocessor.
 //
 
-#include <string.h>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -117,10 +117,12 @@ void HlslScanContext::fillInKeywordMap()
     (*KeywordMap)["in"] =                      EHTokIn;
     (*KeywordMap)["out"] =                     EHTokOut;
     (*KeywordMap)["inout"] =                   EHTokInOut;
+    (*KeywordMap)["layout"] =                  EHTokLayout;
 
     (*KeywordMap)["Buffer"] =                  EHTokBuffer;
     (*KeywordMap)["vector"] =                  EHTokVector;
     (*KeywordMap)["matrix"] =                  EHTokMatrix;
+    (*KeywordMap)["string"] =                  EHTokString;
 
     (*KeywordMap)["void"] =                    EHTokVoid;
     (*KeywordMap)["bool"] =                    EHTokBool;
@@ -410,6 +412,11 @@ EHlslTokenClass HlslScanContext::tokenizeClass(HlslToken& token)
             return token;
         }
 
+        case PpAtomConstString: {
+            parserToken->string = NewPoolTString(ppToken.name);
+            return EHTokStringConstant;
+        }
+
         case EndOfInput:               return EHTokNone;
 
         default:
@@ -457,12 +464,15 @@ EHlslTokenClass HlslScanContext::tokenizeIdentifier()
     case EHTokIn:
     case EHTokOut:
     case EHTokInOut:
+    case EHTokPrecise:
+    case EHTokLayout:
         return keyword;
 
     // template types
     case EHTokBuffer:
     case EHTokVector:
     case EHTokMatrix:
+    case EHTokString:
         return keyword;
 
     // scalar types
