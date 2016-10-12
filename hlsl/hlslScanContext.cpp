@@ -122,9 +122,9 @@ void HlslScanContext::fillInKeywordMap()
     (*KeywordMap)["Buffer"] =                  EHTokBuffer;
     (*KeywordMap)["vector"] =                  EHTokVector;
     (*KeywordMap)["matrix"] =                  EHTokMatrix;
-    (*KeywordMap)["string"] =                  EHTokString;
 
     (*KeywordMap)["void"] =                    EHTokVoid;
+    (*KeywordMap)["string"] =                  EHTokString;
     (*KeywordMap)["bool"] =                    EHTokBool;
     (*KeywordMap)["int"] =                     EHTokInt;
     (*KeywordMap)["uint"] =                    EHTokUint;
@@ -258,6 +258,13 @@ void HlslScanContext::fillInKeywordMap()
     (*KeywordMap)["TextureCubeArray"] =        EHTokTextureCubearray;
     (*KeywordMap)["Texture2DMS"] =             EHTokTexture2DMS;
     (*KeywordMap)["Texture2DMSArray"] =        EHTokTexture2DMSarray;
+    (*KeywordMap)["RWTexture1D"] =             EHTokRWTexture1d;
+    (*KeywordMap)["RWTexture1DArray"] =        EHTokRWTexture1darray;
+    (*KeywordMap)["RWTexture2D"] =             EHTokRWTexture2d;
+    (*KeywordMap)["RWTexture2DArray"] =        EHTokRWTexture2darray;
+    (*KeywordMap)["RWTexture3D"] =             EHTokRWTexture3d;
+    (*KeywordMap)["RWBuffer"] =                EHTokRWBuffer;
+
 
     (*KeywordMap)["struct"] =                  EHTokStruct;
     (*KeywordMap)["cbuffer"] =                 EHTokCBuffer;
@@ -472,11 +479,11 @@ EHlslTokenClass HlslScanContext::tokenizeIdentifier()
     case EHTokBuffer:
     case EHTokVector:
     case EHTokMatrix:
-    case EHTokString:
         return keyword;
 
     // scalar types
     case EHTokVoid:
+    case EHTokString:
     case EHTokBool:
     case EHTokInt:
     case EHTokUint:
@@ -581,6 +588,12 @@ EHlslTokenClass HlslScanContext::tokenizeIdentifier()
     case EHTokTextureCubearray:
     case EHTokTexture2DMS:
     case EHTokTexture2DMSarray:
+    case EHTokRWTexture1d:
+    case EHTokRWTexture1darray:
+    case EHTokRWTexture2d:
+    case EHTokRWTexture2darray:
+    case EHTokRWTexture3d:
+    case EHTokRWBuffer:
         return keyword;
 
     // variable, user type, ...

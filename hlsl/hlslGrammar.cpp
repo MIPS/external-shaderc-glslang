@@ -271,7 +271,7 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
     // typedef
     bool typedefDecl = acceptTokenClass(EHTokTypedef);
 
-    TType type;
+    TType declaredType;
 
     // DX9 sampler declaration use a different syntax
     // DX9 shaders need to run through HLSL compiler (fxc) via a back compat mode, it isn't going to
@@ -280,29 +280,18 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
     // As such, the sampler keyword in D3D10+ turns into an automatic sampler type, and is commonly used
     // For that reason, this line is commented out 
 
-   // if (acceptSamplerDeclarationDX9(type))
+   // if (acceptSamplerDeclarationDX9(declaredType))
    //     return true;
 
     // fully_specified_type
-    if (! acceptFullySpecifiedType(type))
+    if (! acceptFullySpecifiedType(declaredType))
         return false;
-
-    if (type.getQualifier().storage == EvqTemporary && parseContext.symbolTable.atGlobalLevel()) {
-        if (type.getBasicType() == EbtSampler) {
-            // Sampler/textures are uniform by default (if no explicit qualifier is present) in
-            // HLSL.  This line silently converts samplers *explicitly* declared static to uniform,
-            // which is incorrect but harmless.
-            type.getQualifier().storage = EvqUniform; 
-        } else {
-            type.getQualifier().storage = EvqGlobal;
-        }
-    }
 
     // identifier
     HlslToken idToken;
     while (acceptIdentifier(idToken)) {
         // function_parameters
-        TFunction& function = *new TFunction(idToken.string, type);
+        TFunction& function = *new TFunction(idToken.string, declaredType);
         if (acceptFunctionParameters(function)) {
             // post_decls
             acceptPostDecls(function.getWritableType().getQualifier());
@@ -320,20 +309,41 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
                 parseContext.handleFunctionDeclarator(idToken.loc, function, true);
             }
         } else {
-            // a variable declaration
+            // A variable declaration. Fix the storage qualifier if it's a global.
+            if (declaredType.getQualifier().storage == EvqTemporary && parseContext.symbolTable.atGlobalLevel())
+                declaredType.getQualifier().storage = EvqUniform;
 
-            // array_specifier
+            // We can handle multiple variables per type declaration, so 
+            // the number of types can expand when arrayness is different.
+            TType variableType;
+            variableType.shallowCopy(declaredType);
+
+            // recognize array_specifier
             TArraySizes* arraySizes = nullptr;
             acceptArraySpecifier(arraySizes);
 
+            // Fix arrayness in the variableType
+            if (declaredType.isImplicitlySizedArray()) {
+                // Because "int[] a = int[2](...), b = int[3](...)" makes two arrays a and b
+                // of different sizes, for this case sharing the shallow copy of arrayness
+                // with the parseType oversubscribes it, so get a deep copy of the arrayness.
+                variableType.newArraySizes(declaredType.getArraySizes());
+            }
+            if (arraySizes || variableType.isArray()) {
+                // In the most general case, arrayness is potentially coming both from the
+                // declared type and from the variable: "int[] a[];" or just one or the other.
+                // Merge it all to the variableType, so all arrayness is part of the variableType.
+                parseContext.arrayDimMerge(variableType, arraySizes);
+            }
+
             // samplers accept immediate sampler state
-            if (type.getBasicType() == EbtSampler) {
+            if (variableType.getBasicType() == EbtSampler) {
                 if (! acceptSamplerState())
                     return false;
             }
 
             // post_decls
-            acceptPostDecls(type.getQualifier());
+            acceptPostDecls(variableType.getQualifier());
 
             // EQUAL assignment_expression
             TIntermTyped* expressionNode = nullptr;
@@ -346,18 +356,29 @@ bool HlslGrammar::acceptDeclaration(TIntermNode*& node)
                 }
             }
 
-            if (typedefDecl)
-                parseContext.declareTypedef(idToken.loc, *idToken.string, type, arraySizes);
-            else if (type.getBasicType() == EbtBlock)
-                parseContext.declareBlock(idToken.loc, type, idToken.string);
-            else {
-                // Declare the variable and add any initializer code to the AST.
-                // The top-level node is always made into an aggregate, as that's
-                // historically how the AST has been.
-                node = intermediate.growAggregate(node,
-                                                  parseContext.declareVariable(idToken.loc, *idToken.string, type,
-                                                                               arraySizes, expressionNode),
-                                                  idToken.loc);
+            // Hand off the actual declaration
+
+            // TODO: things scoped within an annotation need their own name space;
+            // TODO: strings are not yet handled.
+            if (variableType.getBasicType() != EbtString && parseContext.getAnnotationNestingLevel() == 0) {
+                if (typedefDecl)
+                    parseContext.declareTypedef(idToken.loc, *idToken.string, variableType);
+                else if (variableType.getBasicType() == EbtBlock)
+                    parseContext.declareBlock(idToken.loc, variableType, idToken.string);
+                else {
+                    if (variableType.getQualifier().storage == EvqUniform && ! variableType.isOpaque()) {
+                        // this isn't really an individual variable, but a member of the $Global buffer
+                        parseContext.growGlobalUniformBlock(idToken.loc, variableType, *idToken.string);
+                    } else {
+                        // Declare the variable and add any initializer code to the AST.
+                        // The top-level node is always made into an aggregate, as that's
+                        // historically how the AST has been.
+                        node = intermediate.growAggregate(node,
+                                                          parseContext.declareVariable(idToken.loc, *idToken.string, variableType,
+                                                                                       expressionNode),
+                                                          idToken.loc);
+                    }
+                }
             }
         }
 
@@ -412,7 +433,7 @@ bool HlslGrammar::acceptControlDeclaration(TIntermNode*& node)
         return false;
     }
 
-    node = parseContext.declareVariable(idToken.loc, *idToken.string, type, 0, expressionNode);
+    node = parseContext.declareVariable(idToken.loc, *idToken.string, type, expressionNode);
 
     return true;
 }
@@ -439,8 +460,14 @@ bool HlslGrammar::acceptFullySpecifiedType(TType& type)
         // further, it can create an anonymous instance of the block
         if (peekTokenClass(EHTokSemicolon))
             parseContext.declareBlock(loc, type);
-    } else
+    } else {
+        // Some qualifiers are set when parsing the type.  Merge those with
+        // whatever comes from acceptQualifier.
+        assert(qualifier.layoutFormat == ElfNone);
+        qualifier.layoutFormat = type.getQualifier().layoutFormat;
+
         type.getQualifier() = qualifier;
+    }
 
     return true;
 }
@@ -455,7 +482,7 @@ bool HlslGrammar::acceptQualifier(TQualifier& qualifier)
     do {
         switch (peek()) {
         case EHTokStatic:
-            // normal glslang default
+            qualifier.storage = parseContext.symbolTable.atGlobalLevel() ? EvqGlobal : EvqTemporary;
             break;
         case EHTokExtern:
             // TODO: no meaning in glslang?
@@ -491,10 +518,10 @@ bool HlslGrammar::acceptQualifier(TQualifier& qualifier)
             qualifier.sample = true;
             break;
         case EHTokRowMajor:
-            qualifier.layoutMatrix = ElmRowMajor;
+            qualifier.layoutMatrix = ElmColumnMajor;
             break;
         case EHTokColumnMajor:
-            qualifier.layoutMatrix = ElmColumnMajor;
+            qualifier.layoutMatrix = ElmRowMajor;
             break;
         case EHTokPrecise:
             qualifier.noContraction = true;
@@ -721,36 +748,16 @@ bool HlslGrammar::acceptMatrixTemplateType(TType& type)
     return true;
 }
 
-// string_template_type
-//      : STRING
-//      | STRING identifier LEFT_ANGLE declaration SEMI_COLON ... declaration SEMICOLON RIGHT_ANGLE
+// annotations
+//      : LEFT_ANGLE declaration SEMI_COLON ... declaration SEMICOLON RIGHT_ANGLE
 //
-bool HlslGrammar::acceptStringTemplateType(TType& type)
+bool HlslGrammar::acceptAnnotations(TQualifier&)
 {
-    // STRING
-    if (! acceptTokenClass(EHTokString))
+    if (! acceptTokenClass(EHTokLeftAngle))
         return false;
 
-    // no matter what happens next, we recognized a string type
-    new(&type) TType(EbtString);
-
-    // identifier LEFT_ANGLE, or not?
-    if (! acceptTokenClass(EHTokIdentifier)) {
-        expected("identifier following 'string'");
-        return false;
-    }
-
-    if (! peekTokenClass(EHTokLeftAngle)) {
-        // then it must be the non-template version, back up and let
-        // normal declaration code handle it
-
-        // recede the identifier
-        recedeToken();
-        return true;
-    }
-
-    // move past the LEFT_ANGLE
-    advanceToken();
+    // note that we are nesting a name space
+    parseContext.nestAnnotations();
 
     // declaration SEMI_COLON ... declaration SEMICOLON RIGHT_ANGLE
     do {
@@ -759,15 +766,18 @@ bool HlslGrammar::acceptStringTemplateType(TType& type)
             ;
 
         if (acceptTokenClass(EHTokRightAngle))
-            return true;
+            break;
 
         // declaration
         TIntermNode* node;
         if (! acceptDeclaration(node)) {
-            expected("declaration in string list");
+            expected("declaration in annotation");
             return false;
         }
     } while (true);
+
+    parseContext.unnestAnnotations();
+    return true;
 }
 
 // sampler_type
@@ -823,6 +833,13 @@ bool HlslGrammar::acceptSamplerType(TType& type)
 //      | TEXTURECUBEARRAY
 //      | TEXTURE2DMS
 //      | TEXTURE2DMSARRAY
+//      | RWBUFFER
+//      | RWTEXTURE1D
+//      | RWTEXTURE1DARRAY
+//      | RWTEXTURE2D
+//      | RWTEXTURE2DARRAY
+//      | RWTEXTURE3D
+
 bool HlslGrammar::acceptTextureType(TType& type)
 {
     const EHlslTokenClass textureType = peek();
@@ -830,6 +847,7 @@ bool HlslGrammar::acceptTextureType(TType& type)
     TSamplerDim dim = EsdNone;
     bool array = false;
     bool ms    = false;
+    bool image = false;
 
     switch (textureType) {
     case EHTokBuffer:            dim = EsdBuffer;                      break;
@@ -842,6 +860,12 @@ bool HlslGrammar::acceptTextureType(TType& type)
     case EHTokTextureCubearray:  dim = EsdCube; array = true;          break;
     case EHTokTexture2DMS:       dim = Esd2D; ms = true;               break;
     case EHTokTexture2DMSarray:  dim = Esd2D; array = true; ms = true; break;
+    case EHTokRWBuffer:          dim = EsdBuffer; image=true;          break;
+    case EHTokRWTexture1d:       dim = Esd1D; array=false; image=true; break;
+    case EHTokRWTexture1darray:  dim = Esd1D; array=true;  image=true; break;
+    case EHTokRWTexture2d:       dim = Esd2D; array=false; image=true; break;
+    case EHTokRWTexture2darray:  dim = Esd2D; array=true;  image=true; break;
+    case EHTokRWTexture3d:       dim = Esd3D; array=false; image=true; break;
     default:
         return false;  // not a texture declaration
     }
@@ -852,7 +876,7 @@ bool HlslGrammar::acceptTextureType(TType& type)
     
     TIntermTyped* msCount = nullptr;
 
-    // texture type: required for multisample types!
+    // texture type: required for multisample types and RWBuffer/RWTextures!
     if (acceptTokenClass(EHTokLeftAngle)) {
         if (! acceptType(txType)) {
             expected("scalar or vector type");
@@ -907,22 +931,45 @@ bool HlslGrammar::acceptTextureType(TType& type)
     } else if (ms) {
         expected("texture type for multisample");
         return false;
+    } else if (image) {
+        expected("type for RWTexture/RWBuffer");
+        return false;
     }
 
     TArraySizes* arraySizes = nullptr;
-    const bool shadow = txType.isScalar() || (txType.isVector() && txType.getVectorSize() == 1);
+    const bool shadow = !image && (txType.isScalar() || (txType.isVector() && txType.getVectorSize() == 1));
 
     TSampler sampler;
+    TLayoutFormat format = ElfNone;
 
-    // Buffers are combined.
-    if (dim == EsdBuffer) {
+    // RWBuffer and RWTexture (images) require a TLayoutFormat.  We handle only a limit set.
+    if (image) {
+        if (txType.getVectorSize() != 4)
+            expected("4 component image");
+
+        switch (txType.getBasicType()) {
+        case EbtFloat: format = ElfRgba32f;  break;
+        case EbtInt:   format = ElfRgba32i;  break;
+        case EbtUint:  format = ElfRgba32ui; break;
+        default:
+            expected("unknown basic type in image format");
+        }
+    }
+
+    // Non-image Buffers are combined
+    if (dim == EsdBuffer && !image) {
         sampler.set(txType.getBasicType(), dim, array);
     } else {
         // DX10 textures are separated.  TODO: DX9.
-        sampler.setTexture(txType.getBasicType(), dim, array, shadow, ms);
+        if (image) {
+            sampler.setImage(txType.getBasicType(), dim, array, shadow, ms);
+        } else {
+            sampler.setTexture(txType.getBasicType(), dim, array, shadow, ms);
+        }
     }
     
     type.shallowCopy(TType(sampler, EvqUniform, arraySizes));
+    type.getQualifier().layoutFormat = format;
 
     return true;
 }
@@ -940,10 +987,6 @@ bool HlslGrammar::acceptType(TType& type)
 
     case EHTokMatrix:
         return acceptMatrixTemplateType(type);
-        break;
-
-    case EHTokString:
-        return acceptStringTemplateType(type);
         break;
 
     case EHTokSampler:                // fall through
@@ -966,6 +1009,12 @@ bool HlslGrammar::acceptType(TType& type)
     case EHTokTextureCubearray:       // ...
     case EHTokTexture2DMS:            // ...
     case EHTokTexture2DMSarray:       // ...
+    case EHTokRWTexture1d:            // ...
+    case EHTokRWTexture1darray:       // ...
+    case EHTokRWTexture2d:            // ...
+    case EHTokRWTexture2darray:       // ...
+    case EHTokRWTexture3d:            // ...
+    case EHTokRWBuffer:               // ...
         return acceptTextureType(type);
         break;
 
@@ -989,6 +1038,10 @@ bool HlslGrammar::acceptType(TType& type)
 
     case EHTokVoid:
         new(&type) TType(EbtVoid);
+        break;
+
+    case EHTokString:
+        new(&type) TType(EbtString);
         break;
 
     case EHTokFloat:
@@ -1532,8 +1585,14 @@ bool HlslGrammar::acceptParameterDeclaration(TFunction& function)
     // array_specifier
     TArraySizes* arraySizes = nullptr;
     acceptArraySpecifier(arraySizes);
-    if (arraySizes)
+    if (arraySizes) {
+        if (arraySizes->isImplicit()) {
+            parseContext.error(token.loc, "function parameter array cannot be implicitly sized", "", "");
+            return false;
+        }
+
         type->newArraySizes(*arraySizes);
+    }
 
     // post_decls
     acceptPostDecls(type->getQualifier());
@@ -2618,6 +2677,7 @@ bool HlslGrammar::acceptDefaultLabel(TIntermNode*& statement)
 
 // array_specifier
 //      : LEFT_BRACKET integer_expression RGHT_BRACKET post_decls // optional
+//      : LEFT_BRACKET RGHT_BRACKET post_decls // optional
 //
 void HlslGrammar::acceptArraySpecifier(TArraySizes*& arraySizes)
 {
@@ -2627,21 +2687,25 @@ void HlslGrammar::acceptArraySpecifier(TArraySizes*& arraySizes)
         return;
 
     TSourceLoc loc = token.loc;
-    TIntermTyped* sizeExpr;
-    if (! acceptAssignmentExpression(sizeExpr)) {
-        expected("array-sizing expression");
-        return;
-    }
+    TIntermTyped* sizeExpr = nullptr;
+
+    // Array sizing expression is optional.  If ommitted, array is implicitly sized.
+    const bool hasArraySize = acceptAssignmentExpression(sizeExpr);
 
     if (! acceptTokenClass(EHTokRightBracket)) {
         expected("]");
         return;
     }
 
-    TArraySize arraySize;
-    parseContext.arraySizeCheck(loc, sizeExpr, arraySize);
     arraySizes = new TArraySizes;
-    arraySizes->addInnerSize(arraySize);
+    
+    if (hasArraySize) {
+        TArraySize arraySize;
+        parseContext.arraySizeCheck(loc, sizeExpr, arraySize);
+        arraySizes->addInnerSize(arraySize);
+    } else {
+        arraySizes->addInnerSize();  // implicitly sized
+    }
 }
 
 // post_decls
@@ -2740,16 +2804,9 @@ void HlslGrammar::acceptPostDecls(TQualifier& qualifier)
                 // semantic, in idToken.string
                 parseContext.handleSemantic(idToken.loc, qualifier, *idToken.string);
             }
-        } else if (acceptTokenClass(EHTokLeftAngle)) {
-            // TODO: process annotations, just accepting them for now
-            do {
-                if (peekTokenClass(EHTokNone))
-                    return;
-                if (acceptTokenClass(EHTokRightAngle))
-                    break;
-                advanceToken();
-            } while (true);
-        } else
+        } else if (peekTokenClass(EHTokLeftAngle))
+            acceptAnnotations(qualifier);
+        else
             break;
 
     } while (true);

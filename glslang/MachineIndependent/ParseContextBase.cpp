@@ -36,11 +36,114 @@
 
 // Implement the TParseContextBase class.
 
+#include <cstdarg>
+
 #include "ParseHelper.h"
 
 extern int yyparse(glslang::TParseContext*);
 
 namespace glslang {
+
+//
+// Used to output syntax, parsing, and semantic errors.
+//
+
+void TParseContextBase::outputMessage(const TSourceLoc& loc, const char* szReason,
+                                      const char* szToken,
+                                      const char* szExtraInfoFormat,
+                                      TPrefixType prefix, va_list args)
+{
+    const int maxSize = MaxTokenLength + 200;
+    char szExtraInfo[maxSize];
+
+    safe_vsprintf(szExtraInfo, maxSize, szExtraInfoFormat, args);
+
+    infoSink.info.prefix(prefix);
+    infoSink.info.location(loc);
+    infoSink.info << "'" << szToken <<  "' : " << szReason << " " << szExtraInfo << "\n";
+
+    if (prefix == EPrefixError) {
+        ++numErrors;
+    }
+}
+
+void C_DECL TParseContextBase::error(const TSourceLoc& loc, const char* szReason, const char* szToken,
+                                     const char* szExtraInfoFormat, ...)
+{
+    if (messages & EShMsgOnlyPreprocessor)
+        return;
+    va_list args;
+    va_start(args, szExtraInfoFormat);
+    outputMessage(loc, szReason, szToken, szExtraInfoFormat, EPrefixError, args);
+    va_end(args);
+
+    if ((messages & EShMsgCascadingErrors) == 0)
+        currentScanner->setEndOfInput();
+}
+
+void C_DECL TParseContextBase::warn(const TSourceLoc& loc, const char* szReason, const char* szToken,
+                                    const char* szExtraInfoFormat, ...)
+{
+    if (suppressWarnings())
+        return;
+    va_list args;
+    va_start(args, szExtraInfoFormat);
+    outputMessage(loc, szReason, szToken, szExtraInfoFormat, EPrefixWarning, args);
+    va_end(args);
+}
+
+void C_DECL TParseContextBase::ppError(const TSourceLoc& loc, const char* szReason, const char* szToken,
+                                       const char* szExtraInfoFormat, ...)
+{
+    va_list args;
+    va_start(args, szExtraInfoFormat);
+    outputMessage(loc, szReason, szToken, szExtraInfoFormat, EPrefixError, args);
+    va_end(args);
+
+    if ((messages & EShMsgCascadingErrors) == 0)
+        currentScanner->setEndOfInput();
+}
+
+void C_DECL TParseContextBase::ppWarn(const TSourceLoc& loc, const char* szReason, const char* szToken,
+                                      const char* szExtraInfoFormat, ...)
+{
+    va_list args;
+    va_start(args, szExtraInfoFormat);
+    outputMessage(loc, szReason, szToken, szExtraInfoFormat, EPrefixWarning, args);
+    va_end(args);
+}
+
+// Make a shared symbol have a non-shared version that can be edited by the current 
+// compile, such that editing its type will not change the shared version and will
+// effect all nodes sharing it.
+void TParseContextBase::makeEditable(TSymbol*& symbol)
+{
+    // copyUp() does a deep copy of the type.
+    symbol = symbolTable.copyUp(symbol);
+
+    // Save it in the AST for linker use.
+    intermediate.addSymbolLinkageNode(linkage, *symbol);
+}
+
+// Return a writable version of the variable 'name'.
+//
+// Return nullptr if 'name' is not found.  This should mean
+// something is seriously wrong (e.g., compiler asking self for
+// built-in that doesn't exist).
+TVariable* TParseContextBase::getEditableVariable(const char* name)
+{
+    bool builtIn;
+    TSymbol* symbol = symbolTable.find(name, &builtIn);
+    
+    assert(symbol != nullptr);
+    if (symbol == nullptr)
+        return nullptr;
+
+    if (builtIn)
+        makeEditable(symbol);
+
+    return symbol->getAsVariable();
+}
 
 // Select the best matching function for 'call' from 'candidateList'.
 //
@@ -179,6 +282,62 @@ const TFunction* TParseContextBase::selectFunction(
     }
 
     return incumbent;
+}
+
+//
+// Make the passed-in variable information become a member of the
+// global uniform block.  If this doesn't exist yet, make it.
+//
+void TParseContextBase::growGlobalUniformBlock(TSourceLoc& loc, TType& memberType, TString& memberName)
+{
+    // make the global block, if not yet made
+    if (globalUniformBlock == nullptr) {
+        TString& blockName = *NewPoolTString(getGlobalUniformBlockName());
+        TQualifier blockQualifier;
+        blockQualifier.clear();
+        blockQualifier.storage = EvqUniform;
+        TType blockType(new TTypeList, blockName, blockQualifier);
+        TString* instanceName = NewPoolTString("");
+        globalUniformBlock = new TVariable(instanceName, blockType, true);
+        firstNewMember = 0;
+    }
+
+    // add the requested member as a member to the block
+    TType* type = new TType;
+    type->shallowCopy(memberType);
+    type->setFieldName(memberName);
+    TTypeLoc typeLoc = {type, loc};
+    globalUniformBlock->getType().getWritableStruct()->push_back(typeLoc);
+}
+
+//
+// Insert into the symbol table the global uniform block created in
+// growGlobalUniformBlock(). The variables added as members won't be
+// found unless this is done.
+//
+bool TParseContextBase::insertGlobalUniformBlock()
+{
+    if (globalUniformBlock == nullptr)
+        return true;
+
+    int numMembers = (int)globalUniformBlock->getType().getStruct()->size();
+    bool inserted = false;
+    if (firstNewMember == 0) {
+        // This is the first request; we need a normal symbol table insert
+        inserted = symbolTable.insert(*globalUniformBlock);
+        if (inserted)
+            intermediate.addSymbolLinkageNode(linkage, *globalUniformBlock);
+    } else if (firstNewMember <= numMembers) {
+        // This is a follow-on request; we need to amend the first insert
+        inserted = symbolTable.amend(*globalUniformBlock, firstNewMember);
+    }
+
+    if (inserted) {
+        finalizeGlobalUniformBlockLayout(*globalUniformBlock);
+        firstNewMember = numMembers;
+    }
+
+    return inserted;
 }
 
 } // end namespace glslang

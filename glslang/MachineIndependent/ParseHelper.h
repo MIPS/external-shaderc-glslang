@@ -78,11 +78,21 @@ public:
                       TInfoSink& infoSink, bool forwardCompatible, EShMessages messages)
           : TParseVersions(interm, version, profile, spvVersion, language, infoSink, forwardCompatible, messages),
             symbolTable(symbolTable),
-            linkage(nullptr), scanContext(nullptr), ppContext(nullptr) { }
+            linkage(nullptr), scanContext(nullptr), ppContext(nullptr),
+            globalUniformBlock(nullptr) { }
     virtual ~TParseContextBase() { }
 
+    virtual void C_DECL   error(const TSourceLoc&, const char* szReason, const char* szToken,
+                                const char* szExtraInfoFormat, ...);
+    virtual void C_DECL    warn(const TSourceLoc&, const char* szReason, const char* szToken,
+                                const char* szExtraInfoFormat, ...);
+    virtual void C_DECL ppError(const TSourceLoc&, const char* szReason, const char* szToken,
+                                const char* szExtraInfoFormat, ...);
+    virtual void C_DECL  ppWarn(const TSourceLoc&, const char* szReason, const char* szToken,
+                                const char* szExtraInfoFormat, ...);
+
     virtual void setLimits(const TBuiltInResource&) = 0;
-    
+
     EShLanguage getLanguage() const { return language; }
     TIntermAggregate*& getLinkage() { return linkage; }
     void setScanContext(TScanContext* c) { scanContext = c; }
@@ -126,6 +136,13 @@ public:
 
     TSymbolTable& symbolTable;   // symbol table that goes with the current language, version, and profile
 
+    // Manage the global uniform block (default uniforms in GLSL, $Global in HLSL)
+    // TODO: This could perhaps get its own object, but the current design doesn't work
+    // yet when new uniform variables are declared between function definitions, so
+    // this is pending getting a fully functional design.
+    virtual void growGlobalUniformBlock(TSourceLoc&, TType&, TString& memberName);
+    virtual bool insertGlobalUniformBlock();
+
 protected:
     TParseContextBase(TParseContextBase&);
     TParseContextBase& operator=(TParseContextBase&);
@@ -147,6 +164,18 @@ protected:
         std::function<bool(const TType&, const TType&)>,
         std::function<bool(const TType&, const TType&, const TType&)>,
         /* output */ bool& tie);
+
+    // Manage the global uniform block (default uniforms in GLSL, $Global in HLSL)
+    TVariable* globalUniformBlock;   // the actual block, inserted into the symbol table
+    int firstNewMember;              // the index of the first member not yet inserted into the symbol table
+    // override this to set the language-specific name
+    virtual const char* getGlobalUniformBlockName() { return ""; }
+    virtual void finalizeGlobalUniformBlockLayout(TVariable&) { }
+    virtual void outputMessage(const TSourceLoc&, const char* szReason, const char* szToken,
+                               const char* szExtraInfoFormat, TPrefixType prefix,
+                               va_list args);
+    virtual void makeEditable(TSymbol*&);
+    virtual TVariable* getEditableVariable(const char* name);
 };
 
 //
@@ -201,15 +230,6 @@ public:
     bool parseShaderStrings(TPpContext&, TInputScanner& input, bool versionWillBeError = false);
     void parserError(const char* s);     // for bison's yyerror
 
-    void C_DECL error(const TSourceLoc&, const char* szReason, const char* szToken,
-                      const char* szExtraInfoFormat, ...);
-    void C_DECL  warn(const TSourceLoc&, const char* szReason, const char* szToken,
-                      const char* szExtraInfoFormat, ...);
-    void C_DECL ppError(const TSourceLoc&, const char* szReason, const char* szToken,
-                      const char* szExtraInfoFormat, ...);
-    void C_DECL ppWarn(const TSourceLoc&, const char* szReason, const char* szToken,
-                      const char* szExtraInfoFormat, ...);
-
     void reservedErrorCheck(const TSourceLoc&, const TString&);
     void reservedPpErrorCheck(const TSourceLoc&, const char* name, const char* op);
     bool lineContinuationCheck(const TSourceLoc&, bool endOfComment);
@@ -223,7 +243,6 @@ public:
     void handleIndexLimits(const TSourceLoc&, TIntermTyped* base, TIntermTyped* index);
 
     void makeEditable(TSymbol*&);
-    TVariable* getEditableVariable(const char* name);
     bool isIoResizeArray(const TType&) const;
     void fixIoArraySize(const TSourceLoc&, TType&);
     void ioArrayCheck(const TSourceLoc&, const TType&, const TString& identifier);
@@ -351,9 +370,6 @@ protected:
     TIntermNode* executeInitializer(const TSourceLoc&, TIntermTyped* initializer, TVariable* variable);
     TIntermTyped* convertInitializerList(const TSourceLoc&, const TType&, TIntermTyped* initializer);
     void finalErrorCheck();
-    void outputMessage(const TSourceLoc&, const char* szReason, const char* szToken,
-                       const char* szExtraInfoFormat, TPrefixType prefix,
-                       va_list args);
 
 public:
     //

@@ -1,7 +1,7 @@
 hlsl.gather.basic.dx10.vert
 Shader version: 450
 0:? Sequence
-0:28  Function Definition: main( (global structure{temp 4-component vector of float Pos})
+0:28  Function Definition: main( (temp structure{temp 4-component vector of float Pos})
 0:28    Function Parameters: 
 0:?     Sequence
 0:33      Sequence
@@ -77,8 +77,8 @@ Shader version: 450
 0:?           0.000000
 0:?           0.000000
 0:?           0.000000
-0:?       Sequence
-0:?         Sequence
+0:45      Sequence
+0:45        Sequence
 0:45          move second child to first child (temp 4-component vector of float)
 0:?             'Pos' (out 4-component vector of float Position)
 0:45            Pos: direct index for structure (temp 4-component vector of float)
@@ -110,7 +110,7 @@ Linked vertex stage:
 
 Shader version: 450
 0:? Sequence
-0:28  Function Definition: main( (global structure{temp 4-component vector of float Pos})
+0:28  Function Definition: main( (temp structure{temp 4-component vector of float Pos})
 0:28    Function Parameters: 
 0:?     Sequence
 0:33      Sequence
@@ -186,8 +186,8 @@ Shader version: 450
 0:?           0.000000
 0:?           0.000000
 0:?           0.000000
-0:?       Sequence
-0:?         Sequence
+0:45      Sequence
+0:45        Sequence
 0:45          move second child to first child (temp 4-component vector of float)
 0:?             'Pos' (out 4-component vector of float Position)
 0:45            Pos: direct index for structure (temp 4-component vector of float)

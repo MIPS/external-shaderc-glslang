@@ -185,8 +185,6 @@ struct TSampler {   // misnomer now; includes images, textures without sampler, 
         case EbtFloat:               break;
         case EbtInt:  s.append("i"); break;
         case EbtUint: s.append("u"); break;
-        case EbtInt64:  s.append("i64"); break;
-        case EbtUint64: s.append("u64"); break;
         default:  break;  // some compilers want this
         }
         if (image) {
@@ -623,8 +621,8 @@ public:
                  unsigned int layoutSet                 : 7;
     static const unsigned int layoutSetEnd         =   0x3F;
 
-                 unsigned int layoutBinding             : 8;
-    static const unsigned int layoutBindingEnd    =    0xFF;
+                 unsigned int layoutBinding            : 16;
+    static const unsigned int layoutBindingEnd    =  0xFFFF;
 
                  unsigned int layoutIndex              :  8;
     static const unsigned int layoutIndexEnd    =      0xFF;
@@ -1204,7 +1202,7 @@ public:
             typeName = NewPoolTString(copyOf.typeName->c_str());
     }
 
-    TType* clone()
+    TType* clone() const
     {
         TType *newType = new TType();
         newType->deepCopy(*this);
@@ -1277,7 +1275,11 @@ public:
     virtual bool isImplicitlySizedArray() const { return isArray() && getOuterArraySize() == UnsizedArraySize && qualifier.storage != EvqBuffer; }
     virtual bool isRuntimeSizedArray()    const { return isArray() && getOuterArraySize() == UnsizedArraySize && qualifier.storage == EvqBuffer; }
     virtual bool isStruct() const { return structure != nullptr; }
+#ifdef AMD_EXTENSIONS
+    virtual bool isFloatingDomain() const { return basicType == EbtFloat || basicType == EbtDouble || basicType == EbtFloat16; }
+#else
     virtual bool isFloatingDomain() const { return basicType == EbtFloat || basicType == EbtDouble; }
+#endif
 
     virtual bool isOpaque() const { return basicType == EbtSampler || basicType == EbtAtomicUint; }
 
@@ -1359,6 +1361,9 @@ public:
         case EbtVoid:
         case EbtFloat:
         case EbtDouble:
+#ifdef AMD_EXTENSIONS
+        case EbtFloat16:
+#endif
         case EbtInt:
         case EbtUint:
         case EbtInt64:
@@ -1451,6 +1456,9 @@ public:
         case EbtVoid:              return "void";
         case EbtFloat:             return "float";
         case EbtDouble:            return "double";
+#ifdef AMD_EXTENSIONS
+        case EbtFloat16:           return "float16_t";
+#endif
         case EbtInt:               return "int";
         case EbtUint:              return "uint";
         case EbtInt64:             return "int64_t";
