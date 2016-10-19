@@ -907,12 +907,6 @@ bool HlslGrammar::acceptTextureType(TType& type)
             return false;
         }
 
-        if (txType.getVectorSize() != 1 && txType.getVectorSize() != 4) {
-            // TODO: handle vec2/3 types
-            expected("vector size not yet supported in texture type");
-            return false;
-        }
-
         if (ms && acceptTokenClass(EHTokComma)) {
             // read sample count for multisample types, if given
             if (! peekTokenClass(EHTokIntConstant)) {
@@ -937,24 +931,14 @@ bool HlslGrammar::acceptTextureType(TType& type)
     }
 
     TArraySizes* arraySizes = nullptr;
-    const bool shadow = !image && (txType.isScalar() || (txType.isVector() && txType.getVectorSize() == 1));
+    const bool shadow = false; // declared on the sampler
 
     TSampler sampler;
     TLayoutFormat format = ElfNone;
 
-    // RWBuffer and RWTexture (images) require a TLayoutFormat.  We handle only a limit set.
-    if (image) {
-        if (txType.getVectorSize() != 4)
-            expected("4 component image");
-
-        switch (txType.getBasicType()) {
-        case EbtFloat: format = ElfRgba32f;  break;
-        case EbtInt:   format = ElfRgba32i;  break;
-        case EbtUint:  format = ElfRgba32ui; break;
-        default:
-            expected("unknown basic type in image format");
-        }
-    }
+    // Buffer, RWBuffer and RWTexture (images) require a TLayoutFormat.  We handle only a limit set.
+    if (image || dim == EsdBuffer)
+        format = parseContext.getLayoutFromTxType(token.loc, txType);
 
     // Non-image Buffers are combined
     if (dim == EsdBuffer && !image) {
@@ -967,6 +951,9 @@ bool HlslGrammar::acceptTextureType(TType& type)
             sampler.setTexture(txType.getBasicType(), dim, array, shadow, ms);
         }
     }
+
+    // Remember the declared vector size.
+    sampler.vectorSize = txType.getVectorSize();
     
     type.shallowCopy(TType(sampler, EvqUniform, arraySizes));
     type.getQualifier().layoutFormat = format;
@@ -1783,6 +1770,8 @@ bool HlslGrammar::acceptAssignmentExpression(TIntermTyped*& node)
     }
 
     node = parseContext.handleAssign(loc, assignOp, node, rightNode);
+    node = parseContext.handleLvalue(loc, "assign", node);
+
     if (node == nullptr) {
         parseContext.error(loc, "could not create assignment", "", "");
         return false;
@@ -1946,6 +1935,7 @@ bool HlslGrammar::acceptUnaryExpression(TIntermTyped*& node)
         return true;
 
     node = intermediate.addUnaryMath(unaryOp, node, loc);
+    node = parseContext.handleLvalue(loc, "unary operator", node);
 
     return node != nullptr;
 }
@@ -2061,6 +2051,7 @@ bool HlslGrammar::acceptPostfixExpression(TIntermTyped*& node)
         case EOpPostDecrement:
             // DEC_OP
             node = intermediate.addUnaryMath(postOp, node, loc);
+            node = parseContext.handleLvalue(loc, "unary operator", node);
             break;
         default:
             assert(0);
@@ -2676,35 +2667,40 @@ bool HlslGrammar::acceptDefaultLabel(TIntermNode*& statement)
 }
 
 // array_specifier
-//      : LEFT_BRACKET integer_expression RGHT_BRACKET post_decls // optional
-//      : LEFT_BRACKET RGHT_BRACKET post_decls // optional
+//      : LEFT_BRACKET integer_expression RGHT_BRACKET ... // optional
+//      : LEFT_BRACKET RGHT_BRACKET // optional
 //
 void HlslGrammar::acceptArraySpecifier(TArraySizes*& arraySizes)
 {
     arraySizes = nullptr;
 
-    if (! acceptTokenClass(EHTokLeftBracket))
+    // Early-out if there aren't any array dimensions
+    if (!peekTokenClass(EHTokLeftBracket))
         return;
 
-    TSourceLoc loc = token.loc;
-    TIntermTyped* sizeExpr = nullptr;
-
-    // Array sizing expression is optional.  If ommitted, array is implicitly sized.
-    const bool hasArraySize = acceptAssignmentExpression(sizeExpr);
-
-    if (! acceptTokenClass(EHTokRightBracket)) {
-        expected("]");
-        return;
-    }
-
+    // If we get here, we have at least one array dimension.  This will track the sizes we find.
     arraySizes = new TArraySizes;
-    
-    if (hasArraySize) {
-        TArraySize arraySize;
-        parseContext.arraySizeCheck(loc, sizeExpr, arraySize);
-        arraySizes->addInnerSize(arraySize);
-    } else {
-        arraySizes->addInnerSize();  // implicitly sized
+
+    // Collect each array dimension.
+    while (acceptTokenClass(EHTokLeftBracket)) {
+        TSourceLoc loc = token.loc;
+        TIntermTyped* sizeExpr = nullptr;
+
+        // Array sizing expression is optional.  If ommitted, array will be later sized by initializer list.
+        const bool hasArraySize = acceptAssignmentExpression(sizeExpr);
+
+        if (! acceptTokenClass(EHTokRightBracket)) {
+            expected("]");
+            return;
+        }
+
+        if (hasArraySize) {
+            TArraySize arraySize;
+            parseContext.arraySizeCheck(loc, sizeExpr, arraySize);
+            arraySizes->addInnerSize(arraySize);
+        } else {
+            arraySizes->addInnerSize(0);  // sized by initializers.
+        }
     }
 }
 

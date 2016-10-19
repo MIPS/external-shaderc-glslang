@@ -146,7 +146,8 @@ public:
         shiftTextureBinding(0),
         shiftUboBinding(0),
         autoMapBindings(false),
-        flattenUniformArrays(false)
+        flattenUniformArrays(false),
+        useUnknownFormat(false)
     {
         localSize[0] = 1;
         localSize[1] = 1;
@@ -179,7 +180,9 @@ public:
     bool getAutoMapBindings()             const { return autoMapBindings; }
     void setFlattenUniformArrays(bool flatten)      { flattenUniformArrays = flatten; }
     bool getFlattenUniformArrays()        const { return flattenUniformArrays; }
-
+    void setNoStorageFormat(bool b)             { useUnknownFormat = b; }
+    bool getNoStorageFormat()             const { return useUnknownFormat; }
+    
     void setVersion(int v) { version = v; }
     int getVersion() const { return version; }
     void setProfile(EProfile p) { profile = p; }
@@ -235,6 +238,13 @@ public:
     TIntermBranch* addBranch(TOperator, const TSourceLoc&);
     TIntermBranch* addBranch(TOperator, TIntermTyped*, const TSourceLoc&);
     TIntermTyped* addSwizzle(TVectorFields&, const TSourceLoc&);
+
+    // Low level functions to add nodes (no conversions or other higher level transformations)
+    // If a type is provided, the node's type will be set to it.
+    TIntermBinary* addBinaryNode(TOperator op, TIntermTyped* left, TIntermTyped* right, TSourceLoc) const;
+    TIntermBinary* addBinaryNode(TOperator op, TIntermTyped* left, TIntermTyped* right, TSourceLoc, const TType&) const;
+    TIntermUnary* addUnaryNode(TOperator op, TIntermTyped* child, TSourceLoc) const;
+    TIntermUnary* addUnaryNode(TOperator op, TIntermTyped* child, TSourceLoc, const TType&) const;
 
     // Constant folding (in Constant.cpp)
     TIntermTyped* fold(TIntermAggregate* aggrNode);
@@ -390,6 +400,7 @@ protected:
     unsigned int shiftUboBinding;
     bool autoMapBindings;
     bool flattenUniformArrays;
+    bool useUnknownFormat;
 
     EProfile profile;
     int version;
