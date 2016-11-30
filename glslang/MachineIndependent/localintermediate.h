@@ -144,6 +144,7 @@ public:
         multiStream(false), xfbMode(false),
         shiftSamplerBinding(0),
         shiftTextureBinding(0),
+        shiftImageBinding(0),
         shiftUboBinding(0),
         autoMapBindings(false),
         flattenUniformArrays(false),
@@ -174,6 +175,8 @@ public:
     unsigned int getShiftSamplerBinding() const { return shiftSamplerBinding; }
     void setShiftTextureBinding(unsigned int shift) { shiftTextureBinding = shift; }
     unsigned int getShiftTextureBinding() const { return shiftTextureBinding; }
+    void setShiftImageBinding(unsigned int shift) { shiftImageBinding = shift; }
+    unsigned int getShiftImageBinding() const { return shiftImageBinding; }
     void setShiftUboBinding(unsigned int shift)     { shiftUboBinding = shift; }
     unsigned int getShiftUboBinding()     const { return shiftUboBinding; }
     void setAutoMapBindings(bool map)               { autoMapBindings = map; }
@@ -218,6 +221,7 @@ public:
     TIntermAggregate* growAggregate(TIntermNode* left, TIntermNode* right, const TSourceLoc&);
     TIntermAggregate* makeAggregate(TIntermNode* node);
     TIntermAggregate* makeAggregate(TIntermNode* node, const TSourceLoc&);
+    TIntermAggregate* makeAggregate(const TSourceLoc&);
     TIntermTyped* setAggregateOperator(TIntermNode*, TOperator, const TType& type, TSourceLoc);
     bool areAllChildConst(TIntermAggregate* aggrNode);
     TIntermNode*  addSelection(TIntermTyped* cond, TIntermNodePair code, const TSourceLoc&);
@@ -246,6 +250,9 @@ public:
     TIntermUnary* addUnaryNode(TOperator op, TIntermTyped* child, TSourceLoc) const;
     TIntermUnary* addUnaryNode(TOperator op, TIntermTyped* child, TSourceLoc, const TType&) const;
 
+    // Add conversion from node's type to given basic type.
+    TIntermTyped* convertToBasicType(TOperator op, TBasicType basicType, TIntermTyped* node) const;
+
     // Constant folding (in Constant.cpp)
     TIntermTyped* fold(TIntermAggregate* aggrNode);
     TIntermTyped* foldConstructor(TIntermAggregate* aggrNode);
@@ -257,7 +264,6 @@ public:
 
     // Linkage related
     void addSymbolLinkageNodes(TIntermAggregate*& linkage, EShLanguage, TSymbolTable&);
-    void addSymbolLinkageNode(TIntermAggregate*& linkage, TSymbolTable&, const TString&);
     void addSymbolLinkageNode(TIntermAggregate*& linkage, const TSymbol&);
 
     bool setInvocations(int i) 
@@ -380,6 +386,7 @@ public:
 protected:
     TIntermSymbol* addSymbol(int Id, const TString&, const TType&, const TConstUnionArray&, TIntermTyped* subtree, const TSourceLoc&);
     void error(TInfoSink& infoSink, const char*);
+    void warn(TInfoSink& infoSink, const char*);
     void mergeBodies(TInfoSink&, TIntermSequence& globals, const TIntermSequence& unitGlobals);
     void mergeLinkerObjects(TInfoSink&, TIntermSequence& linkerObjects, const TIntermSequence& unitLinkerObjects);
     void mergeImplicitArraySizes(TType&, const TType&);
@@ -390,13 +397,18 @@ protected:
     bool userOutputUsed() const;
     static int getBaseAlignmentScalar(const TType&, int& size);
     bool isSpecializationOperation(const TIntermOperator&) const;
-
+    bool promote(TIntermOperator*);
+    bool promoteUnary(TIntermUnary&);
+    bool promoteBinary(TIntermBinary&);
+    void addSymbolLinkageNode(TIntermAggregate*& linkage, TSymbolTable&, const TString&);
+    
     const EShLanguage language;  // stage, known at construction time
     EShSource source;            // source language, known a bit later
     std::string entryPointName;
     std::string entryPointMangledName;
     unsigned int shiftSamplerBinding;
     unsigned int shiftTextureBinding;
+    unsigned int shiftImageBinding;
     unsigned int shiftUboBinding;
     bool autoMapBindings;
     bool flattenUniformArrays;
