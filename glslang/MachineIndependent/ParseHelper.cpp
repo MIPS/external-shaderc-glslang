@@ -1109,9 +1109,10 @@ TIntermTyped* TParseContext::handleFunctionCall(const TSourceLoc& loc, TFunction
                 // if builtIn == true, it's definitely a built-in function with EOpNull
                 if (! builtIn) {
                     call->setUserDefined();
-                    if (symbolTable.atGlobalLevel())
-                        error(loc, "can't call user function from global scope", fnCandidate->getName().c_str(), "");
-                    else
+                    if (symbolTable.atGlobalLevel()) {
+                        requireProfile(loc, ~EEsProfile, "calling user function from global scope");
+                        intermediate.addToCallGraph(infoSink, "main(", fnCandidate->getMangledName());
+                    } else
                         intermediate.addToCallGraph(infoSink, currentCaller, fnCandidate->getMangledName());
                 }
 
@@ -4874,7 +4875,7 @@ const TFunction* TParseContext::findFunction400(const TSourceLoc& loc, const TFu
     symbolTable.findFunctionNameList(call.getMangledName(), candidateList, builtIn);
     
     // can 'from' convert to 'to'?
-    const auto convertible = [this](const TType& from, const TType& to) -> bool {
+    const auto convertible = [this](const TType& from, const TType& to, TOperator, int) -> bool {
         if (from == to)
             return true;
         if (from.isArray() || to.isArray() || ! from.sameElementShape(to))
