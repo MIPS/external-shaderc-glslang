@@ -251,10 +251,10 @@ spv::StorageClass TranslateStorageClass(const glslang::TType& type)
         return spv::StorageClassInput;
     else if (type.getQualifier().isPipeOutput())
         return spv::StorageClassOutput;
-    else if (type.getBasicType() == glslang::EbtSampler)
-        return spv::StorageClassUniformConstant;
     else if (type.getBasicType() == glslang::EbtAtomicUint)
         return spv::StorageClassAtomicCounter;
+    else if (type.containsOpaque())
+        return spv::StorageClassUniformConstant;
     else if (type.getQualifier().isUniformOrBuffer()) {
         if (type.getQualifier().layoutPushConstant)
             return spv::StorageClassPushConstant;
@@ -262,7 +262,6 @@ spv::StorageClass TranslateStorageClass(const glslang::TType& type)
             return spv::StorageClassUniform;
         else
             return spv::StorageClassUniformConstant;
-        // TODO: how are we distinguishing between default and non-default non-writable uniforms?  Do default uniforms even exist?
     } else {
         switch (type.getQualifier().storage) {
         case glslang::EvqShared:        return spv::StorageClassWorkgroup;  break;
@@ -472,12 +471,12 @@ spv::BuiltIn TGlslangToSpvTraverser::TranslateBuiltInDecoration(glslang::TBuiltI
     //
     case glslang::EbvClipDistance:
         if (!memberDeclaration)
-        builder.addCapability(spv::CapabilityClipDistance);
+            builder.addCapability(spv::CapabilityClipDistance);
         return spv::BuiltInClipDistance;
 
     case glslang::EbvCullDistance:
         if (!memberDeclaration)
-        builder.addCapability(spv::CapabilityCullDistance);
+            builder.addCapability(spv::CapabilityCullDistance);
         return spv::BuiltInCullDistance;
 
     case glslang::EbvViewportIndex:
@@ -629,29 +628,48 @@ spv::BuiltIn TGlslangToSpvTraverser::TranslateBuiltInDecoration(glslang::TBuiltI
         return spv::BuiltInBaryCoordPullModelAMD;
 #endif
 
+    case glslang::EbvDeviceIndex:
+        builder.addExtension(spv::E_SPV_KHR_device_group);
+        builder.addCapability(spv::CapabilityDeviceGroup);
+        return spv::BuiltInDeviceIndex;
+
+    case glslang::EbvViewIndex:
+        builder.addExtension(spv::E_SPV_KHR_multiview);
+        builder.addCapability(spv::CapabilityMultiView);
+        return spv::BuiltInViewIndex;
+
 #ifdef NV_EXTENSIONS
     case glslang::EbvViewportMaskNV:
         builder.addExtension(spv::E_SPV_NV_viewport_array2);
         builder.addCapability(spv::CapabilityShaderViewportMaskNV);
         return spv::BuiltInViewportMaskNV;
     case glslang::EbvSecondaryPositionNV:
-        builder.addExtension(spv::E_SPV_NV_stereo_view_rendering);
-        builder.addCapability(spv::CapabilityShaderStereoViewNV);
+        if (!memberDeclaration) {
+            builder.addExtension(spv::E_SPV_NV_stereo_view_rendering);
+            builder.addCapability(spv::CapabilityShaderStereoViewNV);
+        }
         return spv::BuiltInSecondaryPositionNV;
     case glslang::EbvSecondaryViewportMaskNV:
-        builder.addExtension(spv::E_SPV_NV_stereo_view_rendering);
-        builder.addCapability(spv::CapabilityShaderStereoViewNV);
+        if (!memberDeclaration) {
+            builder.addExtension(spv::E_SPV_NV_stereo_view_rendering);
+            builder.addCapability(spv::CapabilityShaderStereoViewNV);
+        }
         return spv::BuiltInSecondaryViewportMaskNV;
     case glslang::EbvPositionPerViewNV:
-        builder.addExtension(spv::E_SPV_NVX_multiview_per_view_attributes);
-        builder.addCapability(spv::CapabilityPerViewAttributesNV);
+        if (!memberDeclaration) {
+            builder.addExtension(spv::E_SPV_NVX_multiview_per_view_attributes);
+            builder.addCapability(spv::CapabilityPerViewAttributesNV);
+        }
         return spv::BuiltInPositionPerViewNV;
     case glslang::EbvViewportMaskPerViewNV:
-        builder.addExtension(spv::E_SPV_NVX_multiview_per_view_attributes);
-        builder.addCapability(spv::CapabilityPerViewAttributesNV);
+        if (!memberDeclaration) {
+            builder.addExtension(spv::E_SPV_NVX_multiview_per_view_attributes);
+            builder.addCapability(spv::CapabilityPerViewAttributesNV);
+        }
         return spv::BuiltInViewportMaskPerViewNV;
 #endif 
-    default:                               return spv::BuiltInMax;
+    default:
+        return spv::BuiltInMax;
     }
 }
 
@@ -2722,7 +2740,7 @@ void TGlslangToSpvTraverser::makeFunctions(const glslang::TIntermSequence& glslF
         for (int p = 0; p < (int)parameters.size(); ++p) {
             const glslang::TType& paramType = parameters[p]->getAsTyped()->getType();
             spv::Id typeId = convertGlslangToSpvType(paramType);
-            if (paramType.isOpaque())
+            if (paramType.containsOpaque())
                 typeId = builder.makePointer(TranslateStorageClass(paramType), typeId);
             else if (paramType.getQualifier().storage != glslang::EvqConstReadOnly)
                 typeId = builder.makePointer(spv::StorageClassFunction, typeId);
@@ -3183,7 +3201,7 @@ spv::Id TGlslangToSpvTraverser::handleUserFunctionCall(const glslang::TIntermAgg
         glslangArgs[a]->traverse(this);
         argTypes.push_back(&paramType);
         // keep outputs and opaque objects as l-values, evaluate input-only as r-values
-        if (qualifiers[a] != glslang::EvqConstReadOnly || paramType.isOpaque()) {
+        if (qualifiers[a] != glslang::EvqConstReadOnly || paramType.containsOpaque()) {
             // save l-value
             lValues.push_back(builder.getAccessChain());
         } else {
@@ -3202,7 +3220,7 @@ spv::Id TGlslangToSpvTraverser::handleUserFunctionCall(const glslang::TIntermAgg
     for (int a = 0; a < (int)glslangArgs.size(); ++a) {
         const glslang::TType& paramType = glslangArgs[a]->getAsTyped()->getType();
         spv::Id arg;
-        if (paramType.isOpaque()) {
+        if (paramType.containsOpaque()) {
             builder.setAccessChain(lValues[lValueCount]);
             arg = builder.accessChainGetLValue();
             ++lValueCount;
