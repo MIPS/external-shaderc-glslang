@@ -1789,7 +1789,8 @@ bool TGlslangToSpvTraverser::visitSelection(glslang::TVisit /* visit */, glslang
     // Crucially, side effects must be avoided, and there are performance trade-offs.
     // Return true if good idea (and safe) for OpSelect, false otherwise.
     const auto selectPolicy = [&]() -> bool {
-        if (node->getBasicType() == glslang::EbtVoid)
+        if ((!node->getType().isScalar() && !node->getType().isVector()) ||
+            node->getBasicType() == glslang::EbtVoid)
             return false;
 
         if (node->getTrueBlock()  == nullptr ||
@@ -2740,7 +2741,8 @@ void TGlslangToSpvTraverser::makeFunctions(const glslang::TIntermSequence& glslF
         for (int p = 0; p < (int)parameters.size(); ++p) {
             const glslang::TType& paramType = parameters[p]->getAsTyped()->getType();
             spv::Id typeId = convertGlslangToSpvType(paramType);
-            if (paramType.containsOpaque())
+            if (paramType.containsOpaque() ||
+                (paramType.getBasicType() == glslang::EbtBlock && paramType.getQualifier().storage == glslang::EvqBuffer))
                 typeId = builder.makePointer(TranslateStorageClass(paramType), typeId);
             else if (paramType.getQualifier().storage != glslang::EvqConstReadOnly)
                 typeId = builder.makePointer(spv::StorageClassFunction, typeId);
@@ -3220,7 +3222,8 @@ spv::Id TGlslangToSpvTraverser::handleUserFunctionCall(const glslang::TIntermAgg
     for (int a = 0; a < (int)glslangArgs.size(); ++a) {
         const glslang::TType& paramType = glslangArgs[a]->getAsTyped()->getType();
         spv::Id arg;
-        if (paramType.containsOpaque()) {
+        if (paramType.containsOpaque() ||
+            (paramType.getBasicType() == glslang::EbtBlock && qualifiers[a] == glslang::EvqBuffer)) {
             builder.setAccessChain(lValues[lValueCount]);
             arg = builder.accessChainGetLValue();
             ++lValueCount;

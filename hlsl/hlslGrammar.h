@@ -65,7 +65,6 @@ namespace glslang {
         bool acceptIdentifier(HlslToken&);
         bool acceptCompilationUnit();
         bool acceptDeclaration(TIntermNode*&);
-        bool acceptDeclaration(TIntermNode*& node1, TIntermNode*& node2);
         bool acceptControlDeclaration(TIntermNode*& node);
         bool acceptSamplerDeclarationDX9(TType&);
         bool acceptSamplerState();
@@ -88,7 +87,7 @@ namespace glslang {
         bool acceptStructDeclarationList(TTypeList*&);
         bool acceptFunctionParameters(TFunction&);
         bool acceptParameterDeclaration(TFunction&);
-        bool acceptFunctionDefinition(TFunction&, TIntermNode*& node1, TIntermNode*& node2, const TAttributeMap&);
+        bool acceptFunctionDefinition(TFunction&, TIntermNode*& nodeList, const TAttributeMap&);
         bool acceptParenExpression(TIntermTyped*&);
         bool acceptExpression(TIntermTyped*&);
         bool acceptInitializer(TIntermTyped*&);
@@ -114,7 +113,7 @@ namespace glslang {
         bool acceptCaseLabel(TIntermNode*&);
         bool acceptDefaultLabel(TIntermNode*&);
         void acceptArraySpecifier(TArraySizes*&);
-        void acceptPostDecls(TQualifier&);
+        bool acceptPostDecls(TQualifier&);
         bool acceptDefaultParameterDeclaration(const TType&, TIntermTyped*&);
 
         HlslParseContext& parseContext;  // state of parsing and helper functions for building the intermediate

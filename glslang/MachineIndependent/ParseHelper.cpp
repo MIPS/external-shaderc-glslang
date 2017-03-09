@@ -5597,11 +5597,10 @@ void TParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, con
 
     mergeObjectLayoutQualifiers(defaultQualification, currentBlockQualifier, true);
 
-    // "The offset qualifier can only be used on block members of blocks declared with std140 or std430 layouts."
     // "The align qualifier can only be used on blocks or block members, and only for blocks declared with std140 or std430 layouts."
-    if (currentBlockQualifier.hasAlign() || currentBlockQualifier.hasAlign()) {
+    if (currentBlockQualifier.hasAlign()) {
         if (defaultQualification.layoutPacking != ElpStd140 && defaultQualification.layoutPacking != ElpStd430) {
-            error(loc, "can only be used with std140 or std430 layout packing", "offset/align", "");
+            error(loc, "can only be used with std140 or std430 layout packing", "align", "");
             defaultQualification.layoutAlign = -1;
         }
     }
@@ -5643,9 +5642,12 @@ void TParseContext::declareBlock(const TSourceLoc& loc, TTypeList& typeList, con
             }
         } else
             memberWithoutLocation = true;
-        if (memberQualifier.hasAlign()) {
+
+        // "The offset qualifier can only be used on block members of blocks declared with std140 or std430 layouts."
+        // "The align qualifier can only be used on blocks or block members, and only for blocks declared with std140 or std430 layouts."
+        if (memberQualifier.hasAlign() || memberQualifier.hasOffset()) {
             if (defaultQualification.layoutPacking != ElpStd140 && defaultQualification.layoutPacking != ElpStd430)
-                error(memberLoc, "can only be used with std140 or std430 layout packing", "align", "");
+                error(memberLoc, "can only be used with std140 or std430 layout packing", "offset/align", "");
         }
 
         TQualifier newMemberQualification = defaultQualification;
@@ -5795,11 +5797,8 @@ void TParseContext::blockQualifierCheck(const TSourceLoc& loc, const TQualifier&
         error(loc, "cannot use sample qualifier on an interface block", "sample", "");
     if (qualifier.invariant)
         error(loc, "cannot use invariant qualifier on an interface block", "invariant", "");
-    if (qualifier.layoutPushConstant) {
+    if (qualifier.layoutPushConstant)
         intermediate.addPushConstantCount();
-        if (! instanceName)
-            error(loc, "requires an instance name", "push_constant", "");
-    }
 }
 
 //

@@ -691,6 +691,22 @@ TIntermTyped* HlslParseContext::handleBracketOperator(const TSourceLoc& loc, TIn
         }
     }
 
+    // Handle operator[] on structured buffers: this indexes into the array element of the buffer.
+    // indexStructBufferContent returns nullptr if it isn't a structuredbuffer (SSBO).
+    TIntermTyped* sbArray = indexStructBufferContent(loc, base);
+    if (sbArray != nullptr) {
+        if (sbArray == nullptr)
+            return nullptr;
+
+        // Now we'll apply the [] index to that array
+        const TOperator idxOp = (index->getQualifier().storage == EvqConst) ? EOpIndexDirect : EOpIndexIndirect;
+
+        TIntermTyped* element = intermediate.addIndex(idxOp, sbArray, index, loc);
+        const TType derefType(sbArray->getType(), 0);
+        element->setType(derefType);
+        return element;
+    }
+
     return nullptr;
 }
 
@@ -846,48 +862,17 @@ bool HlslParseContext::isStructBufferMethod(const TString& name) const
 }
 
 //
-// Handle seeing a base.field dereference in the grammar.
+// Handle seeing a base.field dereference in the grammar, where 'field' is a
+// swizzle or member variable.
 //
 TIntermTyped* HlslParseContext::handleDotDereference(const TSourceLoc& loc, TIntermTyped* base, const TString& field)
 {
     variableCheck(base);
 
-    //
-    // methods can't be resolved until we later see the function-calling syntax.
-    // Save away the name in the AST for now.  Processing is completed in
-    // handleLengthMethod(), etc.
-    //
-    if (field == "length") {
-        return intermediate.addMethod(base, TType(EbtInt), &field, loc);
-    } else if (isSamplerMethod(field) && base->getType().getBasicType() == EbtSampler) {
-        // If it's not a method on a sampler object, we fall through to let other objects have a go.
-        const TSampler& sampler = base->getType().getSampler();
-        if (! sampler.isPureSampler()) {
-            const int vecSize = sampler.isShadow() ? 1 : 4; // TODO: handle arbitrary sample return sizes
-            return intermediate.addMethod(base, TType(sampler.type, EvqTemporary, vecSize), &field, loc);
-        }
-    } else if (isStructBufferMethod(field) && 
-               base->getType().isRuntimeSizedArray() &&
-               (base->getQualifier().storage == EvqUniform || base->getQualifier().storage == EvqBuffer)) {
-        TType retType(base->getType(), 0);
-        return intermediate.addMethod(base, retType, &field, loc);
-    } else if (field == "Append" ||
-               field == "RestartStrip") {
-        // We cannot check the type here: it may be sanitized if we're not compiling a geometry shader, but
-        // the code is around in the shader source.
-        return intermediate.addMethod(base, TType(EbtVoid), &field, loc);
-    }
-
-    // It's not .length() if we get to here.
-
     if (base->isArray()) {
         error(loc, "cannot apply to an array:", ".", field.c_str());
-
         return base;
     }
-
-    // It's neither an array nor .length() if we get here,
-    // leaving swizzles and struct/block dereferences.
 
     TIntermTyped* result = base;
     if (base->isVector() || base->isScalar()) {
@@ -995,6 +980,40 @@ TIntermTyped* HlslParseContext::handleDotDereference(const TSourceLoc& loc, TInt
         error(loc, "does not apply to this type:", field.c_str(), base->getType().getCompleteString().c_str());
 
     return result;
+}
+
+//
+// Handle seeing a base.field dereference in the grammar, where 'field' is a
+// built-in method name.
+//
+// Return nullptr if 'field' is not a built-in method.
+//
+TIntermTyped* HlslParseContext::handleBuiltInMethod(const TSourceLoc& loc, TIntermTyped* base, const TString& field)
+{
+    variableCheck(base);
+
+    //
+    // Methods can't be resolved until we finish seeing the function-calling syntax.
+    // Save away the name in the AST for now.
+    //
+    if (isSamplerMethod(field) && base->getType().getBasicType() == EbtSampler) {
+        // If it's not a method on a sampler object, we fall through to let other objects have a go.
+        const TSampler& sampler = base->getType().getSampler();
+        if (! sampler.isPureSampler()) {
+            const int vecSize = sampler.isShadow() ? 1 : 4; // TODO: handle arbitrary sample return sizes
+            return intermediate.addMethod(base, TType(sampler.type, EvqTemporary, vecSize), &field, loc);
+        }
+    } else if (isStructBufferType(base->getType())) {
+        TType retType(base->getType(), 0);
+        return intermediate.addMethod(base, retType, &field, loc);
+    } else if (field == "Append" ||
+               field == "RestartStrip") {
+        // We cannot check the type here: it may be sanitized if we're not compiling a geometry shader, but
+        // the code is around in the shader source.
+        return intermediate.addMethod(base, TType(EbtVoid), &field, loc);
+    }
+
+    return nullptr;
 }
 
 // Split the type of the given node into two structs:
@@ -1507,6 +1526,8 @@ void HlslParseContext::addInterstageIoToLinkage()
 // Handle seeing the function prototype in front of a function definition in the grammar.
 // The body is handled after this function returns.
 //
+// Returns an aggregate of parameter-symbol nodes.
+//
 TIntermAggregate* HlslParseContext::handleFunctionDefinition(const TSourceLoc& loc, TFunction& function,
                                                              const TAttributeMap& attributes, TIntermNode*& entryPointTree)
 {
@@ -1919,9 +1940,11 @@ void HlslParseContext::remapNonEntryPointIO(TFunction& function)
     if (function.getType().getBasicType() != EbtVoid)
         clearUniformInputOutput(function.getWritableType().getQualifier());
 
-    // parameters
+    // parameters.
+    // References to structuredbuffer types are left unmodified
     for (int i = 0; i < function.getParamCount(); i++)
-        clearUniformInputOutput(function[i].type->getQualifier());
+        if (!isReference(*function[i].type))
+            clearUniformInputOutput(function[i].type->getQualifier());
 }
 
 // Handle function returns, including type conversions to the function return type
@@ -2284,12 +2307,16 @@ void HlslParseContext::decomposeStructBufferMethods(const TSourceLoc& loc, TInte
 
     const TOperator op  = node->getAsOperator()->getOp();
     TIntermAggregate* argAggregate = arguments ? arguments->getAsAggregate() : nullptr;
-
-    TIntermTyped* argArray = argAggregate ? argAggregate->getSequence()[0]->getAsTyped() : nullptr;  // array
-
-    // Bail out if not a block method
-    if (argArray == nullptr || !argArray->getType().isRuntimeSizedArray())
+    if (argAggregate == nullptr)
         return;
+
+    // Buffer is the object upon which method is called, so always arg 0
+    TIntermTyped* bufferObj = argAggregate->getSequence()[0]->getAsTyped();
+
+    // Index to obtain the runtime sized array out of the buffer.
+    TIntermTyped* argArray = indexStructBufferContent(loc, bufferObj);
+    if (argArray == nullptr)
+        return;  // It might not be a struct buffer method.
 
     switch (op) {
     case EOpMethodLoad:
@@ -2432,7 +2459,7 @@ void HlslParseContext::decomposeStructBufferMethods(const TSourceLoc& loc, TInte
 
     case EOpMethodGetDimensions:
         {
-            const int numArgs = argAggregate->getSequence().size();
+            const int numArgs = (int)argAggregate->getSequence().size();
             TIntermTyped* argNumItems = argAggregate->getSequence()[1]->getAsTyped();  // out num items
             TIntermTyped* argStride   = numArgs > 2 ? argAggregate->getSequence()[2]->getAsTyped() : nullptr;  // out stride
 
@@ -2681,6 +2708,7 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
             const TSampler& sampler = texType.getSampler();
             const TSamplerDim dim = sampler.dim;
             const bool isImage = sampler.isImage();
+            const bool isMs = sampler.isMultiSample();
             const int numArgs = (int)argAggregate->getSequence().size();
 
             int numDims = 0;
@@ -2691,6 +2719,7 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
             case Esd3D:     numDims = 3; break; // W, H, D
             case EsdCube:   numDims = 2; break; // W, H (cube)
             case EsdBuffer: numDims = 1; break; // W (buffers)
+            case EsdRect:   numDims = 2; break; // W, H (rect)
             default:
                 assert(0 && "unhandled texture dimension");
             }
@@ -2699,17 +2728,31 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
             if (sampler.isArrayed())
                 ++numDims;
 
-            // Establish whether we're querying mip levels
-            const bool mipQuery = (numArgs > (numDims + 1)) && (!sampler.isMultiSample());
+            // Establish whether the method itself is querying mip levels.  This can be false even
+            // if the underlying query requires a MIP level, due to the available HLSL method overloads.
+            const bool mipQuery = (numArgs > (numDims + 1 + (isMs ? 1 : 0)));
+
+            // Establish whether we must use the LOD form of query (even if the method did not supply a mip level to query).
+            // True if:
+            //   1. 1D/2D/3D/Cube AND multisample==0 AND NOT image (those can be sent to the non-LOD query)
+            // or,
+            //   2. There is a LOD (because the non-LOD query cannot be used in that case, per spec)
+            const bool mipRequired =
+                ((dim == Esd1D || dim == Esd2D || dim == Esd3D || dim == EsdCube) && !isMs && !isImage) || // 1...
+                mipQuery; // 2...
 
             // AST assumes integer return.  Will be converted to float if required.
             TIntermAggregate* sizeQuery = new TIntermAggregate(isImage ? EOpImageQuerySize : EOpTextureQuerySize);
             sizeQuery->getSequence().push_back(argTex);
-            // If we're querying an explicit LOD, add the LOD, which is always arg #1
-            if (mipQuery) {
-                TIntermTyped* queryLod = argAggregate->getSequence()[1]->getAsTyped();
+
+            // If we're building an LOD query, add the LOD.
+            if (mipRequired) {
+                // If the base HLSL query had no MIP level given, use level 0.
+                TIntermTyped* queryLod = mipQuery ? argAggregate->getSequence()[1]->getAsTyped() :
+                    intermediate.addConstantUnion(0, loc, true);
                 sizeQuery->getSequence().push_back(queryLod);
             }
+
             sizeQuery->setType(TType(EbtUint, EvqTemporary, numDims));
             sizeQuery->setLoc(loc);
 
@@ -3567,7 +3610,7 @@ void HlslParseContext::decomposeIntrinsic(const TSourceLoc& loc, TIntermTyped*& 
         {
             // input uvecN with low 16 bits of each component holding a float16.  convert to float32.
             TIntermTyped* argValue = node->getAsUnaryNode()->getOperand();
-            TIntermTyped* zero = intermediate.addConstantUnion(0.0, EbtFloat, loc, true);
+            TIntermTyped* zero = intermediate.addConstantUnion(0, loc, true);
             const int vecSize = argValue->getType().getVectorSize();
 
             TOperator constructOp = EOpNull;
@@ -3712,9 +3755,7 @@ TIntermTyped* HlslParseContext::handleFunctionCall(const TSourceLoc& loc, TFunct
     TIntermTyped* result = nullptr;
 
     TOperator op = function->getBuiltInOp();
-    if (op == EOpArrayLength)
-        result = handleLengthMethod(loc, function, arguments);
-    else if (op != EOpNull) {
+    if (op != EOpNull) {
         //
         // Then this should be a constructor.
         // Don't go through the symbol table for constructors.
@@ -3734,13 +3775,13 @@ TIntermTyped* HlslParseContext::handleFunctionCall(const TSourceLoc& loc, TFunct
         // Find it in the symbol table.
         //
         const TFunction* fnCandidate = nullptr;
-        bool builtIn;
+        bool builtIn = false;
 
         // TODO: this needs improvement: there's no way at present to look up a signature in
         // the symbol table for an arbitrary type.  This is a temporary hack until that ability exists.
         // It will have false positives, since it doesn't check arg counts or types.
         if (arguments && arguments->getAsAggregate()) {
-            if (arguments->getAsAggregate()->getSequence()[0]->getAsTyped()->getType().isRuntimeSizedArray()) {
+            if (isStructBufferType(arguments->getAsAggregate()->getSequence()[0]->getAsTyped()->getType())) {
                 if (isStructBufferMethod(function->getName())) {
                     const TString mangle = function->getName() + "(";
                     TSymbol* symbol = symbolTable.find(mangle, &builtIn);
@@ -3826,41 +3867,6 @@ TIntermTyped* HlslParseContext::handleFunctionCall(const TSourceLoc& loc, TFunct
         result = intermediate.addConstantUnion(0.0, EbtFloat, loc);
 
     return result;
-}
-
-// Finish processing object.length(). This started earlier in handleDotDereference(), where
-// the ".length" part was recognized and semantically checked, and finished here where the
-// function syntax "()" is recognized.
-//
-// Return resulting tree node.
-TIntermTyped* HlslParseContext::handleLengthMethod(const TSourceLoc& loc, TFunction* function, TIntermNode* intermNode)
-{
-    int length = 0;
-
-    if (function->getParamCount() > 0)
-        error(loc, "method does not accept any arguments", function->getName().c_str(), "");
-    else {
-        const TType& type = intermNode->getAsTyped()->getType();
-        if (type.isArray()) {
-            if (type.isRuntimeSizedArray()) {
-                // Create a unary op and let the back end handle it
-                return intermediate.addBuiltInFunctionCall(loc, EOpArrayLength, true, intermNode, TType(EbtInt));
-            } else
-                length = type.getOuterArraySize();
-        } else if (type.isMatrix())
-            length = type.getMatrixCols();
-        else if (type.isVector())
-            length = type.getVectorSize();
-        else {
-            // we should not get here, because earlier semantic checking should have prevented this path
-            error(loc, ".length()", "unexpected use of .length()", "");
-        }
-    }
-
-    if (length == 0)
-        length = 1;
-
-    return intermediate.addConstantUnion(length, loc);
 }
 
 //
@@ -5130,6 +5136,95 @@ void HlslParseContext::redeclareBuiltinBlock(const TSourceLoc& loc, TTypeList& n
     trackLinkage(*block);
 }
 
+//
+// Generate index to the array element in a structure buffer (SSBO)
+//
+TIntermTyped* HlslParseContext::indexStructBufferContent(const TSourceLoc& loc, TIntermTyped* buffer) const
+{
+    // Bail out if not a struct buffer
+    if (buffer == nullptr || ! isStructBufferType(buffer->getType()))
+        return nullptr;
+
+    // Runtime sized array is always the last element.
+    const TTypeList* bufferStruct = buffer->getType().getStruct();
+    TIntermTyped* arrayPosition = intermediate.addConstantUnion(unsigned(bufferStruct->size()-1), loc);
+
+    TIntermTyped* argArray = intermediate.addIndex(EOpIndexDirectStruct, buffer, arrayPosition, loc);
+    argArray->setType(*(*bufferStruct)[bufferStruct->size()-1].type);
+
+    return argArray;
+}
+
+//
+// IFF type is a structuredbuffer/byteaddressbuffer type, return the content
+// (template) type.   E.g, StructuredBuffer<MyType> -> MyType.  Else return nullptr.
+//
+TType* HlslParseContext::getStructBufferContentType(const TType& type) const
+{
+    if (type.getBasicType() != EbtBlock)
+        return nullptr;
+
+    const int memberCount = (int)type.getStruct()->size();
+    assert(memberCount > 0);
+
+    TType* contentType = (*type.getStruct())[memberCount-1].type;
+
+    return contentType->isRuntimeSizedArray() ? contentType : nullptr;
+}
+
+//
+// If an existing struct buffer has a sharable type, then share it.
+//
+void HlslParseContext::shareStructBufferType(TType& type)
+{
+    // PackOffset must be equivalent to share types on a per-member basis.
+    // Note: cannot use auto type due to recursion.  Thus, this is a std::function.
+    const std::function<bool(TType& lhs, TType& rhs)>
+    compareQualifiers = [&](TType& lhs, TType& rhs) -> bool {
+        if (lhs.getQualifier().layoutOffset != rhs.getQualifier().layoutOffset)
+            return false;
+
+        if (lhs.isStruct() != rhs.isStruct())
+            return false;
+
+        if (lhs.isStruct() && rhs.isStruct()) {
+            if (lhs.getStruct()->size() != rhs.getStruct()->size())
+                return false;
+
+            for (int i = 0; i < int(lhs.getStruct()->size()); ++i)
+                if (!compareQualifiers(*(*lhs.getStruct())[i].type, *(*rhs.getStruct())[i].type))
+                    return false;
+        }
+
+        return true;
+    };
+
+    // We need to compare certain qualifiers in addition to the type.
+    const auto typeEqual = [compareQualifiers](TType& lhs, TType& rhs) -> bool {
+        if (lhs.getQualifier().readonly != rhs.getQualifier().readonly)
+            return false;
+
+        // If both are structures, recursively look for packOffset equality
+        // as well as type equality.
+        return compareQualifiers(lhs, rhs) && lhs == rhs;
+    };
+
+    // This is an exhaustive O(N) search, but real world shaders have
+    // only a small number of these.
+    for (int idx = 0; idx < int(structBufferTypes.size()); ++idx) {
+        // If the deep structure matches, modulo qualifiers, use it
+        if (typeEqual(*structBufferTypes[idx], type)) {
+            type.shallowCopy(*structBufferTypes[idx]);
+            return;
+        }
+    }
+
+    // Otherwise, remember it:
+    TType* typeCopy = new TType;
+    typeCopy->shallowCopy(type);
+    structBufferTypes.push_back(typeCopy);
+}
+
 void HlslParseContext::paramFix(TType& type)
 {
     switch (type.getQualifier().storage) {
@@ -5140,6 +5235,18 @@ void HlslParseContext::paramFix(TType& type)
     case EvqTemporary:
         type.getQualifier().storage = EvqIn;
         break;
+    case EvqBuffer:
+        {
+            // SSBO parameter.  These do not go through the declareBlock path since they are fn parameters.
+            correctUniform(type.getQualifier());
+            TQualifier bufferQualifier = globalBufferDefaults;
+            mergeObjectLayoutQualifiers(bufferQualifier, type.getQualifier(), true);
+            bufferQualifier.storage = type.getQualifier().storage;
+            bufferQualifier.readonly = type.getQualifier().readonly;
+            bufferQualifier.coherent = type.getQualifier().coherent;
+            type.getQualifier() = bufferQualifier;
+            break;
+        }
     default:
         break;
     }
@@ -5971,6 +6078,19 @@ void HlslParseContext::declareStruct(const TSourceLoc& loc, TString& structName,
     ioTypeMap[type.getStruct()] = newLists;
 }
 
+// Lookup a user-type by name.
+// If found, fill in the type and return the defining symbol.
+// If not found, return nullptr.
+TSymbol* HlslParseContext::lookupUserType(const TString& typeName, TType& type)
+{
+    TSymbol* symbol = symbolTable.find(typeName);
+    if (symbol && symbol->getAsVariable() && symbol->getAsVariable()->isUserType()) {
+        type.shallowCopy(symbol->getType());
+        return symbol;
+    } else
+        return nullptr;
+}
+
 //
 // Do everything necessary to handle a variable (non-block) declaration.
 // Either redeclaring a variable, or making a new one, updating the symbol
@@ -6011,6 +6131,7 @@ TIntermNode* HlslParseContext::declareVariable(const TSourceLoc& loc, TString& i
             if (it != ioTypeMap.end())
                 type.setStruct(it->second.uniform);
         }
+
         break;
     default:
         break;
@@ -6648,8 +6769,6 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TType& type, const TS
                 error(memberLoc, "member cannot contradict block (or what block inherited from global)", "xfb_buffer", "");
         }
 
-        if (memberQualifier.hasPacking())
-            error(memberLoc, "member of block cannot have a packing layout qualifier", typeList[member].type->getFieldName().c_str(), "");
         if (memberQualifier.hasLocation()) {
             switch (type.getQualifier().storage) {
             case EvqVaryingIn:
@@ -6661,10 +6780,6 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TType& type, const TS
             }
         } else
             memberWithoutLocation = true;
-        if (memberQualifier.hasAlign()) {
-            if (defaultQualification.layoutPacking != ElpStd140 && defaultQualification.layoutPacking != ElpStd430)
-                error(memberLoc, "can only be used with std140 or std430 layout packing", "align", "");
-        }
 
         TQualifier newMemberQualification = defaultQualification;
         mergeQualifiers(newMemberQualification, memberQualifier);
