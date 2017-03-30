@@ -601,10 +601,10 @@ int HlslParseContext::getMatrixComponentsColumn(int rows, const TSwizzleSelector
 //
 // Handle seeing a variable identifier in the grammar.
 //
-TIntermTyped* HlslParseContext::handleVariable(const TSourceLoc& loc, TSymbol* symbol, const TString* string)
+TIntermTyped* HlslParseContext::handleVariable(const TSourceLoc& loc, const TString* string)
 {
-    if (symbol == nullptr)
-        symbol = symbolTable.find(*string);
+    int thisDepth;
+    TSymbol* symbol = symbolTable.find(*string, thisDepth);
     if (symbol && symbol->getAsVariable() && symbol->getAsVariable()->isUserType()) {
         error(loc, "expected symbol, not user-defined type", string->c_str(), "");
         return nullptr;
@@ -614,14 +614,21 @@ TIntermTyped* HlslParseContext::handleVariable(const TSourceLoc& loc, TSymbol* s
     if (symbol && symbol->getNumExtensions())
         requireExtensions(loc, symbol->getNumExtensions(), symbol->getExtensions(), symbol->getName().c_str());
 
-    const TVariable* variable;
+    const TVariable* variable = nullptr;
     const TAnonMember* anon = symbol ? symbol->getAsAnonMember() : nullptr;
     TIntermTyped* node = nullptr;
     if (anon) {
-        // It was a member of an anonymous container.
+        // It was a member of an anonymous container, which could be a 'this' structure.
 
         // Create a subtree for its dereference.
-        variable = anon->getAnonContainer().getAsVariable();
+        if (thisDepth > 0) {
+            variable = getImplicitThis(thisDepth);
+            if (variable == nullptr)
+                error(loc, "cannot access member variables (static member function?)", "this", "");
+        }
+        if (variable == nullptr)
+            variable = anon->getAnonContainer().getAsVariable();
+
         TIntermTyped* container = intermediate.addSymbol(*variable, loc);
         TIntermTyped* constNode = intermediate.addConstantUnion(anon->getMemberNumber(), loc);
         node = intermediate.addIndex(EOpIndexDirectStruct, container, constNode, loc);
@@ -805,36 +812,6 @@ TIntermTyped* HlslParseContext::handleUnaryMath(const TSourceLoc& loc, const cha
 
     return childNode;
 }
-
-//
-// Return true if the name is a sampler method
-//
-bool HlslParseContext::isSamplerMethod(const TString& name) const
-{
-    return
-        name == "CalculateLevelOfDetail"          ||
-        name == "CalculateLevelOfDetailUnclamped" ||
-        name == "Gather"                          ||
-        name == "GatherRed"                       ||
-        name == "GatherGreen"                     ||
-        name == "GatherBlue"                      ||
-        name == "GatherAlpha"                     ||
-        name == "GatherCmp"                       ||
-        name == "GatherCmpRed"                    ||
-        name == "GatherCmpGreen"                  ||
-        name == "GatherCmpBlue"                   ||
-        name == "GatherCmpAlpha"                  ||
-        name == "GetDimensions"                   ||
-        name == "GetSamplePosition"               ||
-        name == "Load"                            ||
-        name == "Sample"                          ||
-        name == "SampleBias"                      ||
-        name == "SampleCmp"                       ||
-        name == "SampleCmpLevelZero"              ||
-        name == "SampleGrad"                      ||
-        name == "SampleLevel";
-}
-
 //
 // Return true if the name is a struct buffer method
 //
@@ -983,37 +960,27 @@ TIntermTyped* HlslParseContext::handleDotDereference(const TSourceLoc& loc, TInt
 }
 
 //
-// Handle seeing a base.field dereference in the grammar, where 'field' is a
-// built-in method name.
+// Return true if the field should be treated as a built-in method.
+// Return false otherwise.
 //
-// Return nullptr if 'field' is not a built-in method.
-//
-TIntermTyped* HlslParseContext::handleBuiltInMethod(const TSourceLoc& loc, TIntermTyped* base, const TString& field)
+bool HlslParseContext::isBuiltInMethod(const TSourceLoc&, TIntermTyped* base, const TString& field)
 {
+    if (base == nullptr)
+        return false;
+
     variableCheck(base);
 
-    //
-    // Methods can't be resolved until we finish seeing the function-calling syntax.
-    // Save away the name in the AST for now.
-    //
-    if (isSamplerMethod(field) && base->getType().getBasicType() == EbtSampler) {
-        // If it's not a method on a sampler object, we fall through to let other objects have a go.
-        const TSampler& sampler = base->getType().getSampler();
-        if (! sampler.isPureSampler()) {
-            const int vecSize = sampler.isShadow() ? 1 : 4; // TODO: handle arbitrary sample return sizes
-            return intermediate.addMethod(base, TType(sampler.type, EvqTemporary, vecSize), &field, loc);
-        }
-    } else if (isStructBufferType(base->getType())) {
-        TType retType(base->getType(), 0);
-        return intermediate.addMethod(base, retType, &field, loc);
+    if (base->getType().getBasicType() == EbtSampler) {
+        return true;
+    } else if (isStructBufferType(base->getType()) && isStructBufferMethod(field)) {
+        return true;
     } else if (field == "Append" ||
                field == "RestartStrip") {
         // We cannot check the type here: it may be sanitized if we're not compiling a geometry shader, but
         // the code is around in the shader source.
-        return intermediate.addMethod(base, TType(EbtVoid), &field, loc);
-    }
-
-    return nullptr;
+        return true;
+    } else
+        return false;
 }
 
 // Split the type of the given node into two structs:
@@ -1444,12 +1411,7 @@ void HlslParseContext::assignLocations(TVariable& variable)
             assignLocation(**member);
     } else if (wasSplit(variable.getUniqueId())) {
         TVariable* splitIoVar = getSplitIoVar(&variable);
-        const TTypeList* structure = splitIoVar->getType().getStruct();
-        // Struct splitting can produce empty structures if the only members of the
-        // struct were builtin interstage IO types.  Only assign locations if it
-        // isn't a struct, or is a non-empty struct.
-        if (structure == nullptr || !structure->empty())
-            assignLocation(*splitIoVar);
+        assignLocation(*splitIoVar);
     } else {
         assignLocation(variable);
     }
@@ -1459,7 +1421,7 @@ void HlslParseContext::assignLocations(TVariable& variable)
 // Handle seeing a function declarator in the grammar.  This is the precursor
 // to recognizing a function prototype or function definition.
 //
-TFunction& HlslParseContext::handleFunctionDeclarator(const TSourceLoc& loc, TFunction& function, bool prototype)
+void HlslParseContext::handleFunctionDeclarator(const TSourceLoc& loc, TFunction& function, bool prototype)
 {
     //
     // Multiple declarations of the same function name are allowed.
@@ -1487,13 +1449,6 @@ TFunction& HlslParseContext::handleFunctionDeclarator(const TSourceLoc& loc, TFu
     // other forms of name collisions.
     if (! symbolTable.insert(function))
         error(loc, "function name is redeclaration of existing name", function.getName().c_str(), "");
-
-    //
-    // If this is a redeclaration, it could also be a definition,
-    // in which case, we need to use the parameter names from this one, and not the one that's
-    // being redeclared.  So, pass back this declaration, not the one in the symbol table.
-    //
-    return function;
 }
 
 // Add interstage IO variables to the linkage in canonical order.
@@ -1558,11 +1513,6 @@ TIntermAggregate* HlslParseContext::handleFunctionDefinition(const TSourceLoc& l
     // rest of this function doesn't care.
     entryPointTree = transformEntryPoint(loc, function, attributes);
 
-    // Insert the $Global constant buffer.
-    // TODO: this design fails if new members are declared between function definitions.
-    if (! insertGlobalUniformBlock())
-        error(loc, "failed to insert the global constant buffer", "uniform", "");
-
     //
     // New symbol table scope for body of function plus its arguments
     //
@@ -1582,18 +1532,24 @@ TIntermAggregate* HlslParseContext::handleFunctionDefinition(const TSourceLoc& l
         if (param.name != nullptr) {
             TVariable *variable = new TVariable(param.name, *param.type);
 
+            if (i == 0 && function.hasImplicitThis()) {
+                // Anonymous 'this' members are already in a symbol-table level,
+                // and we need to know what function parameter to map them to.
+                symbolTable.makeInternalVariable(*variable);
+                pushImplicitThis(variable);
+            }
             // Insert the parameters with name in the symbol table.
             if (! symbolTable.insert(*variable))
                 error(loc, "redefinition", variable->getName().c_str(), "");
-            else {
-                // Add the parameter to the AST
-                paramNodes = intermediate.growAggregate(paramNodes,
-                                                        intermediate.addSymbol(*variable, loc),
-                                                        loc);
-            }
+            // Add the parameter to the AST
+            paramNodes = intermediate.growAggregate(paramNodes,
+                                                    intermediate.addSymbol(*variable, loc),
+                                                    loc);
         } else
             paramNodes = intermediate.growAggregate(paramNodes, intermediate.addSymbol(*param.type, loc), loc);
     }
+    if (function.hasIllegalImplicitThis())
+        pushImplicitThis(nullptr);
 
     intermediate.setAggregateOperator(paramNodes, EOpParameters, TType(EbtVoid), loc);
     loopNestingLevel = 0;
@@ -1879,6 +1835,8 @@ void HlslParseContext::handleFunctionBody(const TSourceLoc& loc, TFunction& func
     node->getAsAggregate()->setName(function.getMangledName().c_str());
 
     popScope();
+    if (function.hasImplicitThis())
+        popImplicitThis();
 
     if (function.getType().getBasicType() != EbtVoid && ! functionReturnsValue)
         error(loc, "function does not return a value:", "", function.getName().c_str());
@@ -1892,7 +1850,7 @@ void HlslParseContext::remapEntryPointIO(TFunction& function, TVariable*& return
 {
     // Do the actual work to make a type be a shader input or output variable,
     // and clear the original to be non-IO (for use as a normal function parameter/return).
-    const auto makeIoVariable = [this](const char* name, TType& type, TStorageQualifier storage) {
+    const auto makeIoVariable = [this](const char* name, TType& type, TStorageQualifier storage) -> TVariable* {
         TVariable* ioVariable = makeInternalVariable(name, type);
         clearUniformInputOutput(type.getQualifier());
         if (type.getStruct() != nullptr) {
@@ -2078,7 +2036,7 @@ TIntermTyped* HlslParseContext::handleAssign(const TSourceLoc& loc, TOperator op
 
         if (split && derefType.isBuiltInInterstageIO(language)) {
             // copy from interstage IO builtin if needed
-            subTree = intermediate.addSymbol(*interstageBuiltInIo.find(tInterstageIoData(derefType, outer->getType()))->second);
+            subTree = intermediate.addSymbol(*interstageBuiltInIo.find(HlslParseContext::tInterstageIoData(derefType, outer->getType()))->second);
 
             // Arrayness of builtIn symbols isn't handled by the normal recursion: it's been extracted and moved to the builtin.
             if (subTree->getType().isArray() && !arrayElement.empty()) {
@@ -2141,6 +2099,10 @@ TIntermTyped* HlslParseContext::handleAssign(const TSourceLoc& loc, TOperator op
             // which we traverse in parallel.
             int memberL = 0;
             int memberR = 0;
+
+            // Handle empty structure assignment
+            if (int(membersL.size()) == 0 && int(membersR.size()) == 0)
+                assignList = intermediate.growAggregate(assignList, intermediate.addAssign(op, left, right, loc), loc);
 
             for (int member = 0; member < int(membersL.size()); ++member) {
                 const TType& typeL = *membersL[member].type;
@@ -3043,8 +3005,10 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
             // For now, we have nothing to map the component-wise comparison forms
             // to, because neither GLSL nor SPIR-V has such an opcode.  Issue an
             // unimplemented error instead.  Most of the machinery is here if that
-            // should ever become available.
-            if (cmpValues) {
+            // should ever become available.  However, red can be passed through
+            // to OpImageDrefGather.  G/B/A cannot, because that opcode does not
+            // accept a component.
+            if (cmpValues != 0 && op != EOpMethodGatherCmpRed) {
                 error(loc, "unimplemented: component-level gather compare", "", "");
                 return;
             }
@@ -3125,14 +3089,16 @@ void HlslParseContext::decomposeSampleMethods(const TSourceLoc& loc, TIntermType
             }
 
             // Add comparison value if we have one
-            if (argTex->getType().getSampler().isShadow())
+            if (argCmp != nullptr)
                 txgather->getSequence().push_back(argCmp);
 
             // Add offset (either 1, or an array of 4) if we have one
             if (argOffset != nullptr)
                 txgather->getSequence().push_back(argOffset);
 
-            txgather->getSequence().push_back(argChannel);
+            // Add channel value if the sampler is not shadow
+            if (! argSamp->getType().getSampler().isShadow())
+                txgather->getSequence().push_back(argChannel);
 
             txgather->setType(node->getType());
             txgather->setLoc(loc);
@@ -3782,7 +3748,10 @@ TIntermTyped* HlslParseContext::handleFunctionCall(const TSourceLoc& loc, TFunct
         // It will have false positives, since it doesn't check arg counts or types.
         if (arguments && arguments->getAsAggregate()) {
             if (isStructBufferType(arguments->getAsAggregate()->getSequence()[0]->getAsTyped()->getType())) {
-                if (isStructBufferMethod(function->getName())) {
+                static const int methodPrefixSize = sizeof(BUILTIN_PREFIX)-1;
+
+                if (function->getName().length() > methodPrefixSize &&
+                    isStructBufferMethod(function->getName().substr(methodPrefixSize))) {
                     const TString mangle = function->getName() + "(";
                     TSymbol* symbol = symbolTable.find(mangle, &builtIn);
 
@@ -4192,118 +4161,24 @@ TFunction* HlslParseContext::handleConstructorCall(const TSourceLoc& loc, const 
 // Handle seeing a "COLON semantic" at the end of a type declaration,
 // by updating the type according to the semantic.
 //
-void HlslParseContext::handleSemantic(TSourceLoc loc, TQualifier& qualifier, const TString& semantic)
+void HlslParseContext::handleSemantic(TSourceLoc loc, TQualifier& qualifier, TBuiltInVariable builtIn, const TString& upperCase)
 {
-    // TODO: need to know if it's an input or an output
-    // The following sketches what needs to be done, but can't be right
-    // without taking into account stage and input/output.
+    // adjust for stage in/out
 
-    TString semanticUpperCase = semantic;
-    std::transform(semanticUpperCase.begin(), semanticUpperCase.end(), semanticUpperCase.begin(), ::toupper);
-    // in DX9, all outputs had to have a semantic associated with them, that was either consumed
-    // by the system or was a specific register assignment
-    // in DX10+, only semantics with the SV_ prefix have any meaning beyond decoration
-    // Fxc will only accept DX9 style semantics in compat mode
-    // Also, in DX10 if a SV value is present as the input of a stage, but isn't appropriate for that
-    // stage, it would just be ignored as it is likely there as part of an output struct from one stage
-    // to the next
-
-    bool bParseDX9 = false;
-    if (bParseDX9) {
-        if (semanticUpperCase == "PSIZE")
-            qualifier.builtIn = EbvPointSize;
-        else if (semantic == "FOG")
-            qualifier.builtIn = EbvFogFragCoord;
-        else if (semanticUpperCase == "DEPTH")
-            qualifier.builtIn = EbvFragDepth;
-        else if (semanticUpperCase == "VFACE")
-            qualifier.builtIn = EbvFace;
-        else if (semanticUpperCase == "VPOS")
-            qualifier.builtIn = EbvFragCoord;
+    switch(builtIn) {
+    case EbvPosition:
+        if (language == EShLangFragment)
+            builtIn = EbvFragCoord;
+        break;
+    case EbvStencilRef:
+        error(loc, "unimplemented; need ARB_shader_stencil_export", "SV_STENCILREF", "");
+        break;
+    default:
+        break;
     }
 
-    // SV Position has a different meaning in vertex vs fragment
-    if (semanticUpperCase == "SV_POSITION" && language != EShLangFragment)
-        qualifier.builtIn = EbvPosition;
-    else if (semanticUpperCase == "SV_POSITION" && language == EShLangFragment)
-        qualifier.builtIn = EbvFragCoord;
-    else if (semanticUpperCase == "SV_CLIPDISTANCE")
-        qualifier.builtIn = EbvClipDistance;
-    else if (semanticUpperCase == "SV_CULLDISTANCE")
-        qualifier.builtIn = EbvCullDistance;
-    else if (semanticUpperCase == "SV_VERTEXID")
-        qualifier.builtIn = EbvVertexIndex;
-    else if (semanticUpperCase == "SV_VIEWPORTARRAYINDEX")
-        qualifier.builtIn = EbvViewportIndex;
-    else if (semanticUpperCase == "SV_TESSFACTOR")
-        qualifier.builtIn = EbvTessLevelOuter;
-
-    // Targets are defined 0-7
-    else if (semanticUpperCase == "SV_TARGET") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 0;
-    } else if (semanticUpperCase == "SV_TARGET0") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 0;
-    } else if (semanticUpperCase == "SV_TARGET1") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 1;
-    } else if (semanticUpperCase == "SV_TARGET2") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 2;
-    } else if (semanticUpperCase == "SV_TARGET3") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 3;
-    } else if (semanticUpperCase == "SV_TARGET4") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 4;
-    } else if (semanticUpperCase == "SV_TARGET5") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 5;
-    } else if (semanticUpperCase == "SV_TARGET6") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 6;
-    } else if (semanticUpperCase == "SV_TARGET7") {
-        qualifier.builtIn = EbvNone;
-        // qualifier.layoutLocation = 7;
-    } else if (semanticUpperCase == "SV_SAMPLEINDEX")
-        qualifier.builtIn = EbvSampleId;
-    else if (semanticUpperCase == "SV_RENDERTARGETARRAYINDEX")
-        qualifier.builtIn = EbvLayer;
-    else if (semanticUpperCase == "SV_PRIMITIVEID")
-        qualifier.builtIn = EbvPrimitiveId;
-    else if (semanticUpperCase == "SV_OUTPUTCONTROLPOINTID")
-        qualifier.builtIn = EbvInvocationId;
-    else if (semanticUpperCase == "SV_ISFRONTFACE")
-        qualifier.builtIn = EbvFace;
-    else if (semanticUpperCase == "SV_INSTANCEID")
-        qualifier.builtIn = EbvInstanceIndex;
-    else if (semanticUpperCase == "SV_INSIDETESSFACTOR")
-        qualifier.builtIn = EbvTessLevelInner;
-    else if (semanticUpperCase == "SV_GSINSTANCEID")
-        qualifier.builtIn = EbvInvocationId;
-    else if (semanticUpperCase == "SV_DISPATCHTHREADID")
-        qualifier.builtIn = EbvGlobalInvocationId;
-    else if (semanticUpperCase == "SV_GROUPTHREADID")
-        qualifier.builtIn = EbvLocalInvocationId;
-    else if (semanticUpperCase == "SV_GROUPINDEX")
-        qualifier.builtIn = EbvLocalInvocationIndex;
-    else if (semanticUpperCase == "SV_GROUPID")
-        qualifier.builtIn = EbvWorkGroupId;
-    else if (semanticUpperCase == "SV_DOMAINLOCATION")
-        qualifier.builtIn = EbvTessCoord;
-    else if (semanticUpperCase == "SV_DEPTH")
-        qualifier.builtIn = EbvFragDepth;
-    else if( semanticUpperCase == "SV_COVERAGE")
-        qualifier.builtIn = EbvSampleMask;
-
-    // TODO, these need to get refined to be more specific
-    else if( semanticUpperCase == "SV_DEPTHGREATEREQUAL")
-        qualifier.builtIn = EbvFragDepthGreater;
-    else if( semanticUpperCase == "SV_DEPTHLESSEQUAL")
-        qualifier.builtIn = EbvFragDepthLesser;
-    else if( semanticUpperCase == "SV_STENCILREF")
-        error(loc, "unimplemented; need ARB_shader_stencil_export", "SV_STENCILREF", "");
+    qualifier.builtIn = builtIn;
+    qualifier.semanticName = intermediate.addSemanticName(upperCase);
 }
 
 //
@@ -6825,13 +6700,6 @@ void HlslParseContext::declareBlock(const TSourceLoc& loc, TType& type, const TS
     trackLinkage(variable);
 }
 
-void HlslParseContext::finalizeGlobalUniformBlockLayout(TVariable& block)
-{
-    block.getWritableType().getQualifier().layoutPacking = ElpStd140;
-    block.getWritableType().getQualifier().layoutMatrix = ElmRowMajor;
-    fixBlockUniformOffsets(block.getType().getQualifier(), *block.getWritableType().getWritableStruct());
-}
-
 //
 // "For a block, this process applies to the entire block, or until the first member
 // is reached that has a location layout qualifier. When a block member is declared with a location
@@ -7227,6 +7095,60 @@ TIntermNode* HlslParseContext::addSwitch(const TSourceLoc& loc, TIntermTyped* ex
     return switchNode;
 }
 
+// Make a new symbol-table level that is made out of the members of a structure.
+// This should be done as an anonymous struct (name is "") so that the symbol table
+// finds the members with on explicit reference to a 'this' variable.
+void HlslParseContext::pushThisScope(const TType& thisStruct)
+{
+    TVariable& thisVariable = *new TVariable(NewPoolTString(""), thisStruct);
+    symbolTable.pushThis(thisVariable);
+}
+
+// Track levels of class/struct/namespace nesting with a prefix string using
+// the type names separated by the scoping operator. E.g., two levels
+// would look like:
+//
+//   outer::inner
+//
+// The string is empty when at normal global level.
+//
+void HlslParseContext::pushNamespace(const TString& typeName)
+{
+    // make new type prefix
+    TString newPrefix;
+    if (currentTypePrefix.size() > 0) {
+        newPrefix = currentTypePrefix.back();
+        newPrefix.append(scopeMangler);
+    }
+    newPrefix.append(typeName);
+    currentTypePrefix.push_back(newPrefix);
+}
+
+// Opposite of pushNamespace(), see above
+void HlslParseContext::popNamespace()
+{
+    currentTypePrefix.pop_back();
+}
+
+// Use the class/struct nesting string to create a global name for
+// a member of a class/struct.
+TString* HlslParseContext::getFullNamespaceName(const TString& localName) const
+{
+    TString* name = NewPoolTString("");
+    if (currentTypePrefix.size() > 0)
+        name->append(currentTypePrefix.back());
+    name->append(scopeMangler);
+    name->append(localName);
+
+    return name;
+}
+
+// Helper function to add the namespace scope mangling syntax to a string.
+void HlslParseContext::addScopeMangler(TString& name)
+{
+    name.append(scopeMangler);
+}
+
 // Potentially rename shader entry point function
 void HlslParseContext::renameShaderFunction(TString*& name) const
 {
@@ -7473,9 +7395,9 @@ void HlslParseContext::addPatchConstantInvocation()
             const TStorageQualifier storage = function[p].type->getQualifier().storage;
 
             if (function[p].declaredBuiltIn != EbvNone)
-                builtIns.insert(tInterstageIoData(function[p].declaredBuiltIn, storage));
+                builtIns.insert(HlslParseContext::tInterstageIoData(function[p].declaredBuiltIn, storage));
             else
-                builtIns.insert(tInterstageIoData(function[p].type->getQualifier().builtIn, storage));
+                builtIns.insert(HlslParseContext::tInterstageIoData(function[p].type->getQualifier().builtIn, storage));
         }
     };
 
@@ -7561,8 +7483,9 @@ void HlslParseContext::addPatchConstantInvocation()
 
         notInEntryPoint = pcfBuiltIns;
 
-        for (auto bi : epfBuiltIns) // std::set_difference not usable on unordered containers
-            notInEntryPoint.erase(bi);
+        // std::set_difference not usable on unordered containers
+        for (auto bi = epfBuiltIns.begin(); bi != epfBuiltIns.end(); ++bi)
+            notInEntryPoint.erase(*bi);
 
         // Now we'll add those to the entry and to the linkage.
         for (int p=0; p<pcfParamCount; ++p) {
