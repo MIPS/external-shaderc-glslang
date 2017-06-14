@@ -65,6 +65,7 @@ namespace glslang {
         void unimplemented(const char*);
         bool acceptIdentifier(HlslToken&);
         bool acceptCompilationUnit();
+        bool acceptDeclarationList(TIntermNode*&);
         bool acceptDeclaration(TIntermNode*&);
         bool acceptControlDeclaration(TIntermNode*& node);
         bool acceptSamplerDeclarationDX9(TType&);
@@ -78,7 +79,7 @@ namespace glslang {
         bool acceptTemplateVecMatBasicType(TBasicType&);
         bool acceptVectorTemplateType(TType&);
         bool acceptMatrixTemplateType(TType&);
-        bool acceptTessellationDeclType();
+        bool acceptTessellationDeclType(TBuiltInVariable&);
         bool acceptTessellationPatchTemplateType(TType&);
         bool acceptStreamOutTemplateType(TType&, TLayoutGeometry&);
         bool acceptOutputPrimitiveGeometry(TLayoutGeometry&);
@@ -86,6 +87,7 @@ namespace glslang {
         bool acceptSamplerType(TType&);
         bool acceptTextureType(TType&);
         bool acceptStructBufferType(TType&);
+        bool acceptConstantBufferType(TType&);
         bool acceptStruct(TType&, TIntermNode*& nodeList);
         bool acceptStructDeclarationList(TTypeList*&, TIntermNode*& nodeList, TVector<TFunctionDeclarator>&);
         bool acceptMemberFunctionDefinition(TIntermNode*& nodeList, const TType&, const TString& memberName,
@@ -103,19 +105,19 @@ namespace glslang {
         bool acceptUnaryExpression(TIntermTyped*&);
         bool acceptPostfixExpression(TIntermTyped*&);
         bool acceptConstructor(TIntermTyped*&);
-        bool acceptFunctionCall(HlslToken, TIntermTyped*&, TIntermTyped* objectBase = nullptr,
-                                const TSymbol* scope = nullptr);
+        bool acceptFunctionCall(const TSourceLoc&, TString& name, TIntermTyped*&, TIntermTyped* objectBase);
         bool acceptArguments(TFunction*, TIntermTyped*&);
         bool acceptLiteral(TIntermTyped*&);
+        bool acceptSimpleStatement(TIntermNode*&);
         bool acceptCompoundStatement(TIntermNode*&);
-        bool acceptStatement(TIntermNode*&);
         bool acceptScopedStatement(TIntermNode*&);
         bool acceptScopedCompoundStatement(TIntermNode*&);
+        bool acceptStatement(TIntermNode*&);
         bool acceptNestedStatement(TIntermNode*&);
         void acceptAttributes(TAttributeMap&);
         bool acceptSelectionStatement(TIntermNode*&);
         bool acceptSwitchStatement(TIntermNode*&);
-        bool acceptIterationStatement(TIntermNode*&);
+        bool acceptIterationStatement(TIntermNode*&, const TAttributeMap&);
         bool acceptJumpStatement(TIntermNode*&);
         bool acceptCaseLabel(TIntermNode*&);
         bool acceptDefaultLabel(TIntermNode*&);

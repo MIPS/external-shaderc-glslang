@@ -53,6 +53,10 @@ enum TBasicType {
     EbtUint,
     EbtInt64,
     EbtUint64,
+#ifdef AMD_EXTENSIONS
+    EbtInt16,
+    EbtUint16,
+#endif
     EbtBool,
     EbtAtomicUint,
     EbtSampler,
@@ -219,6 +223,16 @@ enum TBuiltInVariable {
     EbvFragDepthGreater,
     EbvFragDepthLesser,
     EbvStencilRef,
+    EbvGsOutputStream,
+    EbvOutputPatch,
+    EbvInputPatch,
+
+    // structbuffer types
+    EbvAppendConsume, // no need to differentiate append and consume
+    EbvRWStructuredBuffer,
+    EbvStructuredBuffer,
+    EbvByteAddressBuffer,
+    EbvRWByteAddressBuffer,
 
     EbvLast
 };
