@@ -39,6 +39,8 @@
 #include "../glslang/MachineIndependent/parseVersions.h"
 #include "../glslang/MachineIndependent/ParseHelper.h"
 
+#include <array>
+
 namespace glslang {
 
 class TAttributeMap; // forward declare
@@ -77,7 +79,7 @@ public:
     TIntermTyped* handleUnaryMath(const TSourceLoc&, const char* str, TOperator op, TIntermTyped* childNode);
     TIntermTyped* handleDotDereference(const TSourceLoc&, TIntermTyped* base, const TString& field);
     bool isBuiltInMethod(const TSourceLoc&, TIntermTyped* base, const TString& field);
-    void assignLocations(TVariable& variable);
+    void assignToInterface(TVariable& variable);
     void handleFunctionDeclarator(const TSourceLoc&, TFunction& function, bool prototype);
     TIntermAggregate* handleFunctionDefinition(const TSourceLoc&, TFunction&, const TAttributeMap&, TIntermNode*& entryPointTree);
     TIntermNode* transformEntryPoint(const TSourceLoc&, TFunction&, const TAttributeMap&);
@@ -87,9 +89,11 @@ public:
     void remapNonEntryPointIO(TFunction& function);
     TIntermNode* handleReturnValue(const TSourceLoc&, TIntermTyped*);
     void handleFunctionArgument(TFunction*, TIntermTyped*& arguments, TIntermTyped* newArg);
+    TIntermAggregate* executeFlattenedInitializer(const TSourceLoc&, TIntermSymbol*, const TIntermAggregate&);
     TIntermTyped* handleAssign(const TSourceLoc&, TOperator, TIntermTyped* left, TIntermTyped* right);
     TIntermTyped* handleAssignToMatrixSwizzle(const TSourceLoc&, TOperator, TIntermTyped* left, TIntermTyped* right);
     TIntermTyped* handleFunctionCall(const TSourceLoc&, TFunction*, TIntermTyped*);
+    TIntermAggregate* assignClipCullDistance(const TSourceLoc&, TOperator, int semanticId, TIntermTyped* left, TIntermTyped* right);
     void decomposeIntrinsic(const TSourceLoc&, TIntermTyped*& node, TIntermNode* arguments);
     void decomposeSampleMethods(const TSourceLoc&, TIntermTyped*& node, TIntermNode* arguments);
     void decomposeStructBufferMethods(const TSourceLoc&, TIntermTyped*& node, TIntermNode* arguments);
@@ -146,6 +150,7 @@ public:
     void lengthenList(const TSourceLoc&, TIntermSequence& list, int size, TIntermTyped* scalarInit);
     TIntermTyped* handleConstructor(const TSourceLoc&, TIntermTyped*, const TType&);
     TIntermTyped* addConstructor(const TSourceLoc&, TIntermTyped*, const TType&);
+    TIntermTyped* convertArray(TIntermTyped*, const TType&);
     TIntermTyped* constructAggregate(TIntermNode*, const TType&, int, const TSourceLoc&);
     TIntermTyped* constructBuiltIn(const TType&, TOperator, TIntermTyped*, const TSourceLoc&, bool subset);
     void declareBlock(const TSourceLoc&, TType&, const TString* instanceName = 0, TArraySizes* arraySizes = 0);
@@ -157,7 +162,7 @@ public:
     void addQualifierToExisting(const TSourceLoc&, TQualifier, TIdentifierList&);
     void updateStandaloneQualifierDefaults(const TSourceLoc&, const TPublicType&);
     void wrapupSwitchSubsequence(TIntermAggregate* statements, TIntermNode* branchNode);
-    TIntermNode* addSwitch(const TSourceLoc&, TIntermTyped* expression, TIntermAggregate* body);
+    TIntermNode* addSwitch(const TSourceLoc&, TIntermTyped* expression, TIntermAggregate* body, TSelectionControl control);
 
     void updateImplicitArraySize(const TSourceLoc&, TIntermNode*, int index);
 
@@ -189,6 +194,7 @@ public:
     // Apply L-value conversions.  E.g, turning a write to a RWTexture into an ImageStore.
     TIntermTyped* handleLvalue(const TSourceLoc&, const char* op, TIntermTyped*& node);
     TIntermTyped* handleSamplerLvalue(const TSourceLoc&, const char* op, TIntermTyped*& node);
+    TIntermTyped* setOpaqueLvalue(TIntermTyped* left, TIntermTyped* right);
     bool lValueErrorCheck(const TSourceLoc&, const char* op, TIntermTyped*) override;
 
     TLayoutFormat getLayoutFromTxType(const TSourceLoc&, const TType&);
@@ -196,27 +202,28 @@ public:
     bool handleOutputGeometry(const TSourceLoc&, const TLayoutGeometry& geometry);
     bool handleInputGeometry(const TSourceLoc&, const TLayoutGeometry& geometry);
 
+    // Determine selection control from attributes
+    TSelectionControl handleSelectionControl(const TAttributeMap& attributes) const;
+
     // Determine loop control from attributes
     TLoopControl handleLoopControl(const TAttributeMap& attributes) const;
 
     // Potentially rename shader entry point function
     void renameShaderFunction(const TString*& name) const;
 
-    // Reset data for incrementally built referencing of flattened composite structures
-    void initFlattening() { flattenLevel.push_back(0); flattenOffset.push_back(0); }
-    void finalizeFlattening() { flattenLevel.pop_back(); flattenOffset.pop_back(); }
-
     // Share struct buffer deep types
     void shareStructBufferType(TType&);
 
 protected:
     struct TFlattenData {
-        TFlattenData() : nextBinding(TQualifier::layoutBindingEnd) { }
-        TFlattenData(int nb) : nextBinding(nb) { }
+        TFlattenData() : nextBinding(TQualifier::layoutBindingEnd),
+                         nextLocation(TQualifier::layoutLocationEnd) { }
+        TFlattenData(int nb, int nl) : nextBinding(nb), nextLocation(nl) { }
 
         TVector<TVariable*> members;     // individual flattened variables
-        TVector<int>        offsets;     // offset to next tree level
-        int                 nextBinding; // next binding to use.
+        TVector<int> offsets;            // offset to next tree level
+        unsigned int nextBinding;        // next binding to use.
+        unsigned int nextLocation;       // next location to use
     };
 
     void fixConstInit(const TSourceLoc&, const TString& identifier, TType& type, TIntermTyped*& initializer);
@@ -228,7 +235,7 @@ protected:
     TIntermSymbol* makeInternalVariableNode(const TSourceLoc&, const char* name, const TType&) const;
     TVariable* declareNonArray(const TSourceLoc&, const TString& identifier, const TType&, bool track);
     void declareArray(const TSourceLoc&, const TString& identifier, const TType&, TSymbol*&, bool track);
-    TIntermNode* executeInitializer(const TSourceLoc&, TIntermTyped* initializer, TVariable* variable);
+    TIntermNode* executeInitializer(const TSourceLoc&, TIntermTyped* initializer, TVariable* variable, bool flattened);
     TIntermTyped* convertInitializerList(const TSourceLoc&, const TType&, TIntermTyped* initializer, TIntermTyped* scalarInit);
     bool isScalarConstructor(const TIntermNode*);
     TOperator mapAtomicOp(const TSourceLoc& loc, TOperator op, bool isImage);
@@ -238,18 +245,15 @@ protected:
 
     // Array and struct flattening
     TIntermTyped* flattenAccess(TIntermTyped* base, int member);
-    TIntermTyped* flattenAccess(int uniqueId, int member, const TType&);
+    TIntermTyped* flattenAccess(int uniqueId, int member, const TType&, int subset = -1);
     bool shouldFlatten(const TType&) const;
     bool wasFlattened(const TIntermTyped* node) const;
     bool wasFlattened(int id) const { return flattenMap.find(id) != flattenMap.end(); }
-    int  addFlattenedMember(const TSourceLoc& loc, const TVariable&, const TType&, TFlattenData&, const TString& name, bool track);
+    int  addFlattenedMember(const TVariable&, const TType&, TFlattenData&, const TString& name, bool track);
     bool isFinalFlattening(const TType& type) const { return !(type.isStruct() || type.isArray()); }
 
     // Structure splitting (splits interstage built-in types into its own struct)
-    TIntermTyped* splitAccessStruct(const TSourceLoc& loc, TIntermTyped*& base, int& member);
-    void splitAccessArray(const TSourceLoc& loc, TIntermTyped* base, TIntermTyped* index);
     TType& split(TType& type, TString name, const TType* outerStructType = nullptr);
-    void split(TIntermTyped*);
     void split(const TVariable&);
     bool wasSplit(const TIntermTyped* node) const;
     bool wasSplit(int id) const { return splitIoVars.find(id) != splitIoVars.end(); }
@@ -262,10 +266,10 @@ protected:
 
     void fixBuiltInIoType(TType&);
 
-    void flatten(const TSourceLoc& loc, const TVariable& variable);
-    int flatten(const TSourceLoc& loc, const TVariable& variable, const TType&, TFlattenData&, TString name);
-    int flattenStruct(const TSourceLoc& loc, const TVariable& variable, const TType&, TFlattenData&, TString name);
-    int flattenArray(const TSourceLoc& loc, const TVariable& variable, const TType&, TFlattenData&, TString name);
+    void flatten(const TVariable& variable);
+    int flatten(const TVariable& variable, const TType&, TFlattenData&, TString name);
+    int flattenStruct(const TVariable& variable, const TType&, TFlattenData&, TString name);
+    int flattenArray(const TVariable& variable, const TType&, TFlattenData&, TString name);
 
     bool hasUniform(const TQualifier& qualifier) const;
     void clearUniform(TQualifier& qualifier);
@@ -303,6 +307,10 @@ protected:
     // Finalization step: remove unused buffer blocks from linkage (we don't know until the
     // shader is entirely compiled)
     void removeUnusedStructBufferCounters();
+ 
+    static bool isClipOrCullDistance(TBuiltInVariable);
+    static bool isClipOrCullDistance(const TQualifier& qual) { return isClipOrCullDistance(qual.builtIn); }
+    static bool isClipOrCullDistance(const TType& type) { return isClipOrCullDistance(type.getQualifier()); }
 
     // Pass through to base class after remembering builtin mappings.
     using TParseContextBase::trackLinkage;
@@ -363,8 +371,6 @@ protected:
     TVector<TSymbol*> ioArraySymbolResizeList;
 
     TMap<int, TFlattenData> flattenMap;
-    TVector<int> flattenLevel;  // nested postfix operator level for flattening
-    TVector<int> flattenOffset; // cumulative offset for flattening
 
     // IO-type map. Maps a pure symbol-table form of a structure-member list into
     // each of the (up to) three kinds of IO, as each as different allowed decorations,
@@ -407,12 +413,6 @@ protected:
     TMap<tInterstageIoData, TVariable*> interstageBuiltInIo; // individual builtin interstage IO vars, indexed by builtin type.
     TVariable* inputPatch;
 
-    // We have to move array references to structs containing builtin interstage IO to the split variables.
-    // This is only handled for one level.  This stores the index, because we'll need it in the future, since
-    // unlike normal array references, here the index happens before we discover what it applies to.
-    TIntermTyped* builtInIoIndex;
-    TIntermTyped* builtInIoBase;
-
     unsigned int nextInLocation;
     unsigned int nextOutLocation;
 
@@ -427,6 +427,13 @@ protected:
     TVector<TVariable*> implicitThisStack;   // currently active 'this' variables for nested structures
 
     TVariable* gsStreamOutput;               // geometry shader stream outputs, for emit (Append method)
+
+    TVariable* clipDistanceOutput;           // synthesized clip distance output variable (shader might have >1)
+    TVariable* cullDistanceOutput;           // synthesized cull distance output variable (shader might have >1)
+
+    static const int maxClipCullRegs = 2;
+    std::array<int, maxClipCullRegs> clipSemanticNSize; // vector, indexed by clip semantic ID
+    std::array<int, maxClipCullRegs> cullSemanticNSize; // vector, indexed by cull semantic ID
 
     // This tracks the first (mip level) argument to the .mips[][] operator.  Since this can be nested as
     // in tx.mips[tx.mips[0][1].x][2], we need a stack.  We also track the TSourceLoc for error reporting 
