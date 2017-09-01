@@ -20,7 +20,7 @@ output primitive = line_strip
 0:15                0 (const int)
 0:?           Sequence
 0:15            move second child to first child ( temp float)
-0:15              direct index ( temp float)
+0:15              direct index ( out float ClipDistance)
 0:?                 'OutputStream.clip0' ( out 1-element array of float ClipDistance)
 0:15                Constant:
 0:15                  0 (const int)
@@ -30,7 +30,7 @@ output primitive = line_strip
 0:15                  1 (const int)
 0:?           Sequence
 0:15            move second child to first child ( temp float)
-0:15              direct index ( temp float)
+0:15              direct index ( out float CullDistance)
 0:?                 'OutputStream.cull0' ( out 1-element array of float CullDistance)
 0:15                Constant:
 0:15                  0 (const int)
@@ -100,7 +100,7 @@ output primitive = line_strip
 0:15                0 (const int)
 0:?           Sequence
 0:15            move second child to first child ( temp float)
-0:15              direct index ( temp float)
+0:15              direct index ( out float ClipDistance)
 0:?                 'OutputStream.clip0' ( out 1-element array of float ClipDistance)
 0:15                Constant:
 0:15                  0 (const int)
@@ -110,7 +110,7 @@ output primitive = line_strip
 0:15                  1 (const int)
 0:?           Sequence
 0:15            move second child to first child ( temp float)
-0:15              direct index ( temp float)
+0:15              direct index ( out float CullDistance)
 0:?                 'OutputStream.cull0' ( out 1-element array of float CullDistance)
 0:15                Constant:
 0:15                  0 (const int)

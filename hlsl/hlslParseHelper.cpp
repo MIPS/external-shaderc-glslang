@@ -66,6 +66,8 @@ HlslParseContext::HlslParseContext(TSymbolTable& symbolTable, TIntermediate& int
     entryPointFunction(nullptr),
     entryPointFunctionBody(nullptr),
     gsStreamOutput(nullptr),
+    clipDistanceInput(nullptr),
+    cullDistanceInput(nullptr),
     clipDistanceOutput(nullptr),
     cullDistanceOutput(nullptr)
 {
@@ -80,8 +82,10 @@ HlslParseContext::HlslParseContext(TSymbolTable& symbolTable, TIntermediate& int
     globalInputDefaults.clear();
     globalOutputDefaults.clear();
 
-    clipSemanticNSize.fill(0);
-    cullSemanticNSize.fill(0);
+    clipSemanticNSizeIn.fill(0);
+    cullSemanticNSizeIn.fill(0);
+    clipSemanticNSizeOut.fill(0);
+    cullSemanticNSizeOut.fill(0);
 
     // "Shaders in the transform
     // feedback capturing mode have an initial global default of
@@ -1152,14 +1156,18 @@ void HlslParseContext::splitBuiltIn(const TString& baseName, const TType& member
     if (arraySizes != nullptr && !memberType.isArray())
         ioVar->getWritableType().newArraySizes(*arraySizes);
 
-    fixBuiltInIoType(ioVar->getWritableType());
-
     splitBuiltIns[tInterstageIoData(memberType.getQualifier().builtIn, outerQualifier.storage)] = ioVar;
     if (!isClipOrCullDistance(ioVar->getType()))
         trackLinkage(*ioVar);
 
     // Merge qualifier from the user structure
     mergeQualifiers(ioVar->getWritableType().getQualifier(), outerQualifier);
+
+    // Fix the builtin type if needed (e.g, some types require fixed array sizes, no matter how the
+    // shader declared them).  This is done after mergeQualifiers(), in case fixBuiltInIoType looks
+    // at the qualifier to determine e.g, in or out qualifications.
+    fixBuiltInIoType(ioVar->getWritableType());
+
     // But, not location, we're losing that
     ioVar->getWritableType().getQualifier().layoutLocation = TQualifier::layoutLocationEnd;
 }
@@ -1483,10 +1491,18 @@ void HlslParseContext::fixBuiltInIoType(TType& type)
         }
     default:
         if (isClipOrCullDistance(type)) {
+            const int loc = type.getQualifier().layoutLocation;
+
             if (type.getQualifier().builtIn == EbvClipDistance) {
-                clipSemanticNSize[type.getQualifier().layoutLocation] = type.getVectorSize();
+                if (type.getQualifier().storage == EvqVaryingIn)
+                    clipSemanticNSizeIn[loc] = type.getVectorSize();
+                else
+                    clipSemanticNSizeOut[loc] = type.getVectorSize();
             } else {
-                cullSemanticNSize[type.getQualifier().layoutLocation] = type.getVectorSize();
+                if (type.getQualifier().storage == EvqVaryingIn)
+                    cullSemanticNSizeIn[loc] = type.getVectorSize();
+                else
+                    cullSemanticNSizeOut[loc] = type.getVectorSize();
             }
         }
 
@@ -2271,26 +2287,39 @@ void HlslParseContext::handleFunctionArgument(TFunction* function,
 TIntermAggregate* HlslParseContext::assignClipCullDistance(const TSourceLoc& loc, TOperator op, int semanticId,
                                                            TIntermTyped* left, TIntermTyped* right)
 {
+    switch (language) {
+    case EShLangFragment:
+    case EShLangVertex:
+    case EShLangGeometry:
+        break;
+    default:
+        error(loc, "unimplemented: clip/cull not currently implemented for this stage", "", "");
+        return nullptr;
+    }
+
     TVariable** clipCullVar = nullptr;
 
-    const TBuiltInVariable builtInType = left->getQualifier().builtIn;
+    // Figure out if we are assigning to, or from, clip or cull distance.
+    const bool isOutput = isClipOrCullDistance(left->getType());
 
-    // array sizes, or 1 if it's not an array:
-    const int rhsArraySize = (right->getType().isArray() ? right->getType().getOuterArraySize() : 1);
-    // vector sizes:
-    const int rhsVectorSize = right->getType().getVectorSize();
+    // This is the rvalue or lvalue holding the clip or cull distance.
+    TIntermTyped* clipCullNode = isOutput ? left : right;
+    // This is the value going into or out of the clip or cull distance.
+    TIntermTyped* internalNode = isOutput ? right : left;
 
-    decltype(clipSemanticNSize)* semanticNSize = nullptr;
+    const TBuiltInVariable builtInType = clipCullNode->getQualifier().builtIn;
+
+    decltype(clipSemanticNSizeIn)* semanticNSize = nullptr;
 
     // Refer to either the clip or the cull distance, depending on semantic.
     switch (builtInType) {
     case EbvClipDistance:
-        clipCullVar = &clipDistanceOutput;
-        semanticNSize = &clipSemanticNSize;
+        clipCullVar = isOutput ? &clipDistanceOutput : &clipDistanceInput;
+        semanticNSize = isOutput ? &clipSemanticNSizeOut : &clipSemanticNSizeIn;
         break;
     case EbvCullDistance:
-        clipCullVar = &cullDistanceOutput;
-        semanticNSize = &cullSemanticNSize;
+        clipCullVar = isOutput ? &cullDistanceOutput : &cullDistanceInput;
+        semanticNSize = isOutput ? &cullSemanticNSizeOut : &cullSemanticNSizeIn;
         break;
 
     // called invalidly: we expected a clip or a cull distance.
@@ -2316,31 +2345,52 @@ TIntermAggregate* HlslParseContext::assignClipCullDistance(const TSourceLoc& loc
         vecItems += (*semanticNSize)[x];
         arrayLoc += (*semanticNSize)[x];
     }
-        
+ 
+
+    // It can have up to 2 array dimensions (in the case of geometry shader inputs)
+    const TArraySizes* const internalArraySizes = internalNode->getType().getArraySizes();
+    const int internalArrayDims = internalNode->getType().isArray() ? internalArraySizes->getNumDims() : 0;
+    // vector sizes:
+    const int internalVectorSize = internalNode->getType().getVectorSize();
+    // array sizes, or 1 if it's not an array:
+    const int internalInnerArraySize = (internalArrayDims > 0 ? internalArraySizes->getDimSize(internalArrayDims-1) : 1);
+    const int internalOuterArraySize = (internalArrayDims > 1 ? internalArraySizes->getDimSize(0) : 1);
+
+    // The created type may be an array of arrays, e.g, for geometry shader inputs.
+    const bool isImplicitlyArrayed = (language == EShLangGeometry && !isOutput);
 
     // If we haven't created the output already, create it now.
     if (*clipCullVar == nullptr) {
-        // ClipDistance and CullDistance are handled specially in the entry point output 
-        // copy algorithm, because they may need to be unpacked from components of vectors
-        // (or a scalar) into a float array.  Here, we make the array the right size and type,
+        // ClipDistance and CullDistance are handled specially in the entry point input/output copy
+        // algorithm, because they may need to be unpacked from components of vectors (or a scalar)
+        // into a float array, or vice versa.  Here, we make the array the right size and type,
         // which depends on the incoming data, which has several potential dimensions:
-        //    Semantic ID
-        //    vector size
-        //    array size
+        //    * Semantic ID
+        //    * vector size 
+        //    * array size
         // Of those, semantic ID and array size cannot appear simultaneously.
+        //
+        // Also to note: for implicitly arrayed forms (e.g, geometry shader inputs), we need to create two
+        // array dimensions.  The shader's declaration may have one or two array dimensions.  One is always
+        // the geometry's dimension.
 
-        const int requiredArraySize = arrayLoc * rhsArraySize;
+        const bool useInnerSize = internalArrayDims > 1 || !isImplicitlyArrayed;
 
-        TType clipCullType(EbtFloat, left->getType().getQualifier().storage, 1);
-        clipCullType.getQualifier() = left->getType().getQualifier();
+        const int requiredInnerArraySize = arrayLoc * (useInnerSize ? internalInnerArraySize : 1);
+        const int requiredOuterArraySize = (internalArrayDims > 0) ? internalArraySizes->getDimSize(0) : 1;
+
+        TType clipCullType(EbtFloat, clipCullNode->getType().getQualifier().storage, 1);
+        clipCullType.getQualifier() = clipCullNode->getType().getQualifier();
 
         // Create required array dimension
         TArraySizes arraySizes;
-        arraySizes.addInnerSize(requiredArraySize);
+        if (isImplicitlyArrayed)
+            arraySizes.addInnerSize(requiredOuterArraySize);
+        arraySizes.addInnerSize(requiredInnerArraySize);
         clipCullType.newArraySizes(arraySizes);
 
         // Obtain symbol name: we'll use that for the symbol we introduce.
-        TIntermSymbol* sym = left->getAsSymbolNode();
+        TIntermSymbol* sym = clipCullNode->getAsSymbolNode();
         assert(sym != nullptr);
 
         // We are moving the semantic ID from the layout location, so it is no longer needed or
@@ -2354,66 +2404,105 @@ TIntermAggregate* HlslParseContext::assignClipCullDistance(const TSourceLoc& loc
     }
 
     // Create symbol for the clip or cull variable.
-    left = intermediate.addSymbol(**clipCullVar);
+    TIntermSymbol* clipCullSym = intermediate.addSymbol(**clipCullVar);
+
+    // vector sizes:
+    const int clipCullVectorSize = clipCullSym->getType().getVectorSize();
 
     // array sizes, or 1 if it's not an array:
-    const int lhsArraySize = (left->getType().isArray() ? left->getType().getOuterArraySize() : 1);
-    // vector sizes:
-    const int lhsVectorSize = left->getType().getVectorSize();
+    const TArraySizes* const clipCullArraySizes = clipCullSym->getType().getArraySizes();
+    const int clipCullOuterArraySize = isImplicitlyArrayed ? clipCullArraySizes->getDimSize(0) : 1;
+    const int clipCullInnerArraySize = clipCullArraySizes->getDimSize(isImplicitlyArrayed ? 1 : 0);
 
-    // left has got to be an array of scalar floats, per SPIR-V semantics.
+    // clipCullSym has got to be an array of scalar floats, per SPIR-V semantics.
     // fixBuiltInIoType() should have handled that upstream.
-    assert(left->getType().isArray());
-    assert(left->getType().getVectorSize() == 1);
-    assert(left->getType().getBasicType() == EbtFloat);
+    assert(clipCullSym->getType().isArray());
+    assert(clipCullSym->getType().getVectorSize() == 1);
+    assert(clipCullSym->getType().getBasicType() == EbtFloat);
 
     // We may be creating multiple sub-assignments.  This is an aggregate to hold them.
     // TODO: it would be possible to be clever sometimes and avoid the sequence node if not needed.
     TIntermAggregate* assignList = nullptr;
 
+    // Holds individual component assignments as we make them.
+    TIntermTyped* clipCullAssign = nullptr;
+
     // If the types are homomorphic, use a simple assign.  No need to mess about with 
     // individual components.
-    if (left->getType().isArray() == right->getType().isArray() &&
-        lhsArraySize == rhsArraySize &&
-        lhsVectorSize == rhsVectorSize) {
-        assignList = intermediate.growAggregate(assignList, intermediate.addAssign(op, left, right, loc));
+    if (clipCullSym->getType().isArray() == internalNode->getType().isArray() &&
+        clipCullInnerArraySize == internalInnerArraySize &&
+        clipCullOuterArraySize == internalOuterArraySize &&
+        clipCullVectorSize == internalVectorSize) {
+
+        if (isOutput)
+            clipCullAssign = intermediate.addAssign(op, clipCullSym, internalNode, loc);
+        else
+            clipCullAssign = intermediate.addAssign(op, internalNode, clipCullSym, loc);
+
+        assignList = intermediate.growAggregate(assignList, clipCullAssign);
         assignList->setOperator(EOpSequence);
+
         return assignList;
     }
 
-    // We are going to copy each component of the right (per array element if indicated) to sequential
-    // array elements of the left.  This tracks the lhs element we're writing to as we go along.
+    // We are going to copy each component of the internal (per array element if indicated) to sequential
+    // array elements of the clipCullSym.  This tracks the lhs element we're writing to as we go along.
     // We may be starting in the middle - e.g, for a non-zero semantic ID calculated above.
-    int lhsArrayPos = semanticOffset[semanticId];
+    int clipCullInnerArrayPos = semanticOffset[semanticId];
+    int clipCullOuterArrayPos = 0;
 
-    // Loop through every component of every element of the RHS, and copy to LHS elements in turn.
-    for (int rhsArrayPos = 0; rhsArrayPos < rhsArraySize; ++rhsArrayPos) {
-        for (int rhsComponent = 0; rhsComponent < rhsVectorSize; ++rhsComponent) {
-            // LHS array member to write to:
-            TIntermTyped* lhsMember = intermediate.addIndex(EOpIndexDirect, left,
-                                                            intermediate.addConstantUnion(lhsArrayPos++, loc), loc);
+    // Lambda to add an index to a node, set the type of the result, and return the new node.
+    const auto addIndex = [this, &loc](TIntermTyped* node, int pos) -> TIntermTyped* {
+        const TType derefType(node->getType(), 0);
+        node = intermediate.addIndex(EOpIndexDirect, node, intermediate.addConstantUnion(pos, loc), loc);
+        node->setType(derefType);
+        return node;
+    };
 
-            TIntermTyped* rhsMember = right;
+    // Loop through every component of every element of the internal, and copy to or from the matching external.
+    for (int internalOuterArrayPos = 0; internalOuterArrayPos < internalOuterArraySize; ++internalOuterArrayPos) {
+        for (int internalInnerArrayPos = 0; internalInnerArrayPos < internalInnerArraySize; ++internalInnerArrayPos) {
+            for (int internalComponent = 0; internalComponent < internalVectorSize; ++internalComponent) {
+                // clip/cull array member to read from / write to:
+                TIntermTyped* clipCullMember = clipCullSym;
 
-            // If right is an array, extract the element of interest
-            if (right->getType().isArray()) {
-                const TType derefType(rhsMember->getType(), 0);
-                rhsMember = intermediate.addIndex(EOpIndexDirect, rhsMember,
-                                                  intermediate.addConstantUnion(rhsArrayPos, loc), loc);
-                rhsMember->setType(derefType);
+                // If implicitly arrayed, there is an outer array dimension involved
+                if (isImplicitlyArrayed)
+                    clipCullMember = addIndex(clipCullMember, clipCullOuterArrayPos);
+
+                // Index into proper array position for clip cull member
+                clipCullMember = addIndex(clipCullMember, clipCullInnerArrayPos++);
+
+                // if needed, start over with next outer array slice.
+                if (isImplicitlyArrayed && clipCullInnerArrayPos >= clipCullInnerArraySize) {
+                    clipCullInnerArrayPos = semanticOffset[semanticId];
+                    ++clipCullOuterArrayPos;
+                }
+
+                // internal member to read from / write to:
+                TIntermTyped* internalMember = internalNode;
+
+                // If internal node has outer array dimension, index appropriately.
+                if (internalArrayDims > 1)
+                    internalMember = addIndex(internalMember, internalOuterArrayPos);
+
+                // If internal node has inner array dimension, index appropriately.
+                if (internalArrayDims > 0)
+                    internalMember = addIndex(internalMember, internalInnerArrayPos);
+
+                // If internal node is a vector, extract the component of interest.
+                if (internalNode->getType().isVector())
+                    internalMember = addIndex(internalMember, internalComponent);
+
+                // Create an assignment: output from internal to clip cull, or input from clip cull to internal.
+                if (isOutput)
+                    clipCullAssign = intermediate.addAssign(op, clipCullMember, internalMember, loc);
+                else
+                    clipCullAssign = intermediate.addAssign(op, internalMember, clipCullMember, loc);
+
+                // Track assignment in the sequence.
+                assignList = intermediate.growAggregate(assignList, clipCullAssign);
             }
-
-            // If right is a vector, extract the component of interest.
-            if (right->getType().isVector()) {
-                const TType derefType(rhsMember->getType(), 0);
-                rhsMember = intermediate.addIndex(EOpIndexDirect, rhsMember,
-                                                  intermediate.addConstantUnion(rhsComponent, loc), loc);
-                rhsMember->setType(derefType);
-            }
-
-            // Assign: to the proper lhs member.
-            assignList = intermediate.growAggregate(assignList,
-                                                    intermediate.addAssign(op, lhsMember, rhsMember, loc));
         }
     }
 
@@ -2483,8 +2572,10 @@ TIntermTyped* HlslParseContext::handleAssign(const TSourceLoc& loc, TOperator op
     // isn't, we fall back to a member-wise copy.
     if (!isFlattenLeft && !isFlattenRight && !isSplitLeft && !isSplitRight) {
         // Clip and cull distance requires more processing.  See comment above assignClipCullDistance.
-        if (isClipOrCullDistance(left->getType())) {
-            const int semanticId = left->getType().getQualifier().layoutLocation;
+        if (isClipOrCullDistance(left->getType()) || isClipOrCullDistance(right->getType())) {
+            const bool isOutput = isClipOrCullDistance(left->getType());
+
+            const int semanticId = (isOutput ? left : right)->getType().getQualifier().layoutLocation;
             return assignClipCullDistance(loc, op, semanticId, left, right);
         }
 
@@ -2664,13 +2755,15 @@ TIntermTyped* HlslParseContext::handleAssign(const TSourceLoc& loc, TOperator op
                 TIntermTyped* subSplitRight = isSplitRight ? getMember(false, right, member, splitRight, memberR)
                                                            : subRight;
 
-                if (isClipOrCullDistance(subSplitLeft->getType())) {
+                if (isClipOrCullDistance(subSplitLeft->getType()) || isClipOrCullDistance(subSplitRight->getType())) {
                     // Clip and cull distance built-in assignment is complex in its own right, and is handled in
                     // a separate function dedicated to that task.  See comment above assignClipCullDistance;
 
+                    const bool isOutput = isClipOrCullDistance(subSplitLeft->getType());
+
                     // Since all clip/cull semantics boil down to the same built-in type, we need to get the
                     // semantic ID from the dereferenced type's layout location, to avoid an N-1 mapping.
-                    const TType derefType(left->getType(), member);
+                    const TType derefType((isOutput ? left : right)->getType(), member);
                     const int semanticId = derefType.getQualifier().layoutLocation;
 
                     TIntermAggregate* clipCullAssign = assignClipCullDistance(loc, op, semanticId,
@@ -5057,7 +5150,7 @@ void HlslParseContext::expandArguments(const TSourceLoc& loc, const TFunction& f
     const auto setArgList = [&](int paramNum, const TVector<TIntermTyped*>& args) {
         if (args.size() == 1)
             setArg(paramNum, args.front());
-        else {
+        else if (args.size() > 1) {
             if (function.getParamCount() + functionParamNumberOffset == 1) {
                 arguments = intermediate.makeAggregate(args.front());
                 std::for_each(args.begin() + 1, args.end(), 
@@ -5068,8 +5161,8 @@ void HlslParseContext::expandArguments(const TSourceLoc& loc, const TFunction& f
                 auto it = aggregate->getSequence().erase(aggregate->getSequence().begin() + paramNum);
                 aggregate->getSequence().insert(it, args.begin(), args.end());
             }
+            functionParamNumberOffset += (int)(args.size() - 1);
         }
-        functionParamNumberOffset += (args.size() - 1);
     };
 
     // Process each argument's conversion
@@ -8785,10 +8878,6 @@ void HlslParseContext::correctInput(TQualifier& qualifier)
         qualifier.clearInterpolation();
         qualifier.sample = false;
     }
-
-    // TODO: handle clip/cull on the input side; this doesn't work, see overwrite of .layoutLocation later
-    if (isClipOrCullDistance(qualifier))
-        qualifier.layoutLocation = TQualifier::layoutLocationEnd;
 
     qualifier.clearStreamLayout();
     qualifier.clearXfbLayout();
