@@ -91,18 +91,16 @@ TParseContextBase* CreateParseContext(TSymbolTable& symbolTable, TIntermediate& 
                                       int version, EProfile profile, EShSource source,
                                       EShLanguage language, TInfoSink& infoSink,
                                       SpvVersion spvVersion, bool forwardCompatible, EShMessages messages,
-                                      bool parsingBuiltIns, const std::string sourceEntryPointName = "")
+                                      bool parsingBuiltIns, std::string sourceEntryPointName = "")
 {
-#ifndef ENABLE_HLSL
-    (void)sourceEntryPointName; // Unused argument.
-#endif
-
     switch (source) {
-    case EShSourceGlsl:
-        intermediate.setEntryPointName("main");
+    case EShSourceGlsl: {
+        if (sourceEntryPointName.size() == 0)
+            intermediate.setEntryPointName("main");
+        TString entryPoint = sourceEntryPointName.c_str();
         return new TParseContext(symbolTable, intermediate, parsingBuiltIns, version, profile, spvVersion,
-                                 language, infoSink, forwardCompatible, messages);
-
+                                 language, infoSink, forwardCompatible, messages, &entryPoint);
+    }
 #ifdef ENABLE_HLSL
     case EShSourceHlsl:
         return new HlslParseContext(symbolTable, intermediate, parsingBuiltIns, version, profile, spvVersion,
@@ -1663,20 +1661,30 @@ void TShader::addProcesses(const std::vector<std::string>& p)
     intermediate->addProcesses(p);
 }
 
+// Set binding base for given resource type
+void TShader::setShiftBinding(TResourceType res, unsigned int base) {
+    intermediate->setShiftBinding(res, base);
+}
+
+// Set binding base for given resource type for a given binding set.
+void TShader::setShiftBindingForSet(TResourceType res, unsigned int set, unsigned int base) {
+    intermediate->setShiftBindingForSet(res, set, base); 
+}
+
 // Set binding base for sampler types
-void TShader::setShiftSamplerBinding(unsigned int base) { intermediate->setShiftSamplerBinding(base); }
+void TShader::setShiftSamplerBinding(unsigned int base) { setShiftBinding(EResSampler, base); }
 // Set binding base for texture types (SRV)
-void TShader::setShiftTextureBinding(unsigned int base) { intermediate->setShiftTextureBinding(base); }
+void TShader::setShiftTextureBinding(unsigned int base) { setShiftBinding(EResTexture, base); }
 // Set binding base for image types
-void TShader::setShiftImageBinding(unsigned int base)   { intermediate->setShiftImageBinding(base); }
+void TShader::setShiftImageBinding(unsigned int base)   { setShiftBinding(EResImage, base); }
 // Set binding base for uniform buffer objects (CBV)
-void TShader::setShiftUboBinding(unsigned int base)     { intermediate->setShiftUboBinding(base); }
+void TShader::setShiftUboBinding(unsigned int base)     { setShiftBinding(EResUbo, base); }
 // Synonym for setShiftUboBinding, to match HLSL language.
-void TShader::setShiftCbufferBinding(unsigned int base) { intermediate->setShiftUboBinding(base); }
+void TShader::setShiftCbufferBinding(unsigned int base) { setShiftBinding(EResUbo, base); }
 // Set binding base for UAV (unordered access view)
-void TShader::setShiftUavBinding(unsigned int base)     { intermediate->setShiftUavBinding(base); }
+void TShader::setShiftUavBinding(unsigned int base)     { setShiftBinding(EResUav, base); }
 // Set binding base for SSBOs
-void TShader::setShiftSsboBinding(unsigned int base)    { intermediate->setShiftSsboBinding(base); }
+void TShader::setShiftSsboBinding(unsigned int base)    { setShiftBinding(EResSsbo, base); }
 // Enables binding automapping using TIoMapper
 void TShader::setAutoMapBindings(bool map)              { intermediate->setAutoMapBindings(map); }
 // Fragile: currently within one stage: simple auto-assignment of location
